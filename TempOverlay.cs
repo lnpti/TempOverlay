@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.2.5.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.2.5";
+        public const string Version = "1.3.0";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -79,13 +79,17 @@ namespace TempOverlay
         public bool ShowClock = true, ShowSeconds = true, ShowDate = true, ShowIcon = true;
         public string LogoPath = "";
         public int Scale = 100;
+        public string AirIp = "", AirChannels = "1", AirText = "NO AR";
+        public bool AirFader = true;
 
         public static readonly string Dir = Environment.GetEnvironmentVariable("TEMPOVERLAY_DIR") ??
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), Const.App);
         public static readonly string FilePath = Path.Combine(Dir, "config.json");
 
         public Config Clone() { return (Config)MemberwiseClone(); }
-        public bool IsPanel { get { return Style == "panel" || Style == "panel2"; } }
+        public bool HasAir { get { return Style == "panel_air" || Style == "panel2_air"; } }
+        public bool IsPanel { get { return Style == "panel" || Style == "panel2" || HasAir; } }
+        public int PanelKind { get { return (Style == "panel2" || Style == "panel2_air") ? 2 : 1; } }
 
         public static Config Load()
         {
@@ -108,6 +112,8 @@ namespace TempOverlay
                 c.ShowDate = Json.B(d, "show_date", c.ShowDate); c.ShowIcon = Json.B(d, "show_icon", c.ShowIcon);
                 c.LogoPath = Json.S(d, "logo_path", "");
                 c.Scale = Math.Max(30, Math.Min(400, Json.I(d, "scale", 100)));
+                c.AirIp = Json.S(d, "air_ip", ""); c.AirChannels = Json.S(d, "air_channels", "1");
+                c.AirText = Json.S(d, "air_text", "NO AR"); c.AirFader = Json.B(d, "air_fader", true);
             }
             catch { }
             return c;
@@ -130,6 +136,7 @@ namespace TempOverlay
                 r("locked", b(Locked)); r("x", X.ToString()); r("y", Y.ToString()); r("autostart", b(Autostart));
                 r("auto_update", b(AutoUpdate)); r("show_clock", b(ShowClock)); r("show_seconds", b(ShowSeconds));
                 r("show_date", b(ShowDate)); r("show_icon", b(ShowIcon)); s("logo_path", LogoPath); r("scale", Scale.ToString());
+                s("air_ip", AirIp); s("air_channels", AirChannels); s("air_text", AirText); r("air_fader", b(AirFader));
                 sb.Append("  \"last_update_check\": " + LastUpdateCheck.ToString("R", CultureInfo.InvariantCulture) + "\n}\n");
                 File.WriteAllText(FilePath, sb.ToString(), new UTF8Encoding(false));
             }
@@ -435,6 +442,128 @@ namespace TempOverlay
         }
     }
 
+    // ---------- Behringer X32 (OSC por UDP, porta 10023): canal aberto/mudo + fader ----------
+    static class X32
+    {
+        const int Port = 10023;
+
+        static byte[] Pad(string s)
+        {
+            byte[] b = Encoding.ASCII.GetBytes(s), o = new byte[(b.Length / 4 + 1) * 4];
+            Buffer.BlockCopy(b, 0, o, 0, b.Length);
+            return o;
+        }
+        static int Al(int n) { return (n + 4) & ~3; }   // tamanho de uma string OSC (n chars + NUL) alinhada a 4
+
+        static bool Parse(byte[] d, int len, out string addr, out float val)
+        {
+            addr = null; val = 0;
+            int z = Array.IndexOf(d, (byte)0, 0, len); if (z <= 0) return false;
+            addr = Encoding.ASCII.GetString(d, 0, z);
+            int p = Al(z);
+            if (p + 1 >= len || d[p] != (byte)',') return false;
+            char t = (char)d[p + 1];
+            int z2 = Array.IndexOf(d, (byte)0, p, len - p); if (z2 < 0) return false;
+            p += Al(z2 - p);
+            if (p + 4 > len) return false;
+            byte[] b = new byte[] { d[p + 3], d[p + 2], d[p + 1], d[p] };   // big-endian
+            if (t == 'i') val = BitConverter.ToInt32(b, 0);
+            else if (t == 'f') val = BitConverter.ToSingle(b, 0);
+            else return false;
+            return true;
+        }
+
+        public static Dictionary<string, float> Query(string ip, List<string> addrs, int timeoutMs)
+        {
+            Dictionary<string, float> res = new Dictionary<string, float>();
+            IPAddress addr; if (!IPAddress.TryParse(ip, out addr)) return res;
+            using (UdpClient u = new UdpClient(AddressFamily.InterNetwork))
+            {
+                IPEndPoint ep = new IPEndPoint(addr, Port);
+                foreach (string a in addrs) { byte[] m = Pad(a); u.Send(m, m.Length, ep); }
+                DateTime end = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                while (res.Count < addrs.Count)
+                {
+                    int left = (int)(end - DateTime.UtcNow).TotalMilliseconds; if (left <= 0) break;
+                    u.Client.ReceiveTimeout = left;
+                    try
+                    {
+                        IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                        byte[] d = u.Receive(ref from); string a; float v;
+                        if (Parse(d, d.Length, out a, out v)) res[a] = v;
+                    }
+                    catch (SocketException) { break; }
+                }
+            }
+            return res;
+        }
+
+        // "1", "ch2", "aux1", "bus3", "mtx2", "dca4", "main", "mono"  ->  enderecos OSC de on/fader
+        public static List<string[]> Tokens(string channels)
+        {
+            List<string[]> list = new List<string[]>();
+            foreach (string raw in Regex.Split(channels ?? "", "[,; ]+"))
+            {
+                string t = raw.Trim().ToLowerInvariant(); if (t.Length == 0) continue;
+                string bas = null, name = t;
+                Match m = Regex.Match(t, "^(ch|aux|auxin|bus|mtx|dca)?(\\d+)$");
+                if (m.Success)
+                {
+                    int n = int.Parse(m.Groups[2].Value); string kind = m.Groups[1].Value, nn = n.ToString("00");
+                    if ((kind == "" || kind == "ch") && n >= 1 && n <= 32) { bas = "/ch/" + nn + "/mix"; name = "Canal " + n; }
+                    else if ((kind == "aux" || kind == "auxin") && n >= 1 && n <= 8) { bas = "/auxin/" + nn + "/mix"; name = "Aux " + n; }
+                    else if (kind == "bus" && n >= 1 && n <= 16) { bas = "/bus/" + nn + "/mix"; name = "Bus " + n; }
+                    else if (kind == "mtx" && n >= 1 && n <= 6) { bas = "/mtx/" + nn + "/mix"; name = "Matrix " + n; }
+                    else if (kind == "dca" && n >= 1 && n <= 8) { bas = "/dca/" + n; name = "DCA " + n; }
+                }
+                else if (t == "main" || t == "st" || t == "lr") { bas = "/main/st/mix"; name = "Main LR"; }
+                else if (t == "mono" || t == "m") { bas = "/main/m/mix"; name = "Mono"; }
+                if (bas != null) list.Add(new string[] { bas + "/on", bas + "/fader", name });
+            }
+            return list;
+        }
+
+        // 1 = no ar (algum canal aberto), 0 = fora do ar, -1 = sem resposta da mesa
+        public static int State(string ip, string channels, bool useFader)
+        {
+            List<string[]> tk = Tokens(channels);
+            if (tk.Count == 0) return -1;
+            List<string> addrs = new List<string>();
+            foreach (string[] t in tk) { addrs.Add(t[0]); if (useFader) addrs.Add(t[1]); }
+            Dictionary<string, float> r = Query(ip, addrs, 700);
+            if (r.Count == 0) return -1;
+            foreach (string[] t in tk)
+            {
+                float on, f;
+                if (r.TryGetValue(t[0], out on) && on >= 0.5f)
+                    if (!useFader || !r.TryGetValue(t[1], out f) || f > 0.0625f) return 1;   // 0,0625 = -60 dB
+            }
+            return 0;
+        }
+
+        static string Db(float f)
+        {
+            double d = f >= 0.5f ? f * 40 - 30 : (f >= 0.25f ? f * 80 - 50 : (f >= 0.0625f ? f * 160 - 70 : f * 480 - 90));
+            return d <= -89 ? "-inf dB" : d.ToString("0.#", CultureInfo.InvariantCulture) + " dB";
+        }
+        public static string Describe(string ip, string channels)
+        {
+            List<string[]> tk = Tokens(channels);
+            if (tk.Count == 0) return "Nenhum canal válido. Ex.: 1  ou  1,2,aux1,bus3,main";
+            List<string> addrs = new List<string>();
+            foreach (string[] t in tk) { addrs.Add(t[0]); addrs.Add(t[1]); }
+            Dictionary<string, float> r = Query(ip, addrs, 1500);
+            if (r.Count == 0) return "Sem resposta da mesa em " + ip + " (porta 10023). Confira o IP e se o PC está na mesma rede da X32.";
+            StringBuilder sb = new StringBuilder("Conectado à X32.\n");
+            foreach (string[] t in tk)
+            {
+                float on, f; bool ho = r.TryGetValue(t[0], out on), hf = r.TryGetValue(t[1], out f);
+                sb.Append(t[2] + ": " + (!ho ? "sem resposta" : (on >= 0.5f ? "aberto" : "mudo")) + (hf ? ", fader " + Db(f) : "") + "\n");
+            }
+            return sb.ToString().TrimEnd();
+        }
+    }
+
     // ---------- janela do overlay (camada com alfa por pixel: texto nitido sem franjas) ----------
     class Overlay : Form
     {
@@ -447,6 +576,7 @@ namespace TempOverlay
         Bitmap logo;
         public int WeatherCode = -1;
         public bool ReserveIcon;
+        public int AirState = -1;   // 1 no ar, 0 fora, -1 sem resposta da X32
         static readonly CultureInfo PtBr = new CultureInfo("pt-BR");
         public void SetLogo(Bitmap b) { if (logo != null) logo.Dispose(); logo = b; }
         public Point Pos = new Point(40, 40); // posicao propria (nao depende de Form.Location)
@@ -530,8 +660,7 @@ namespace TempOverlay
         public void Draw(Config c, string label, string temp)
         {
             lastScale = c.Scale;
-            if (c.Style == "panel") { DrawPanel(c, label, temp); return; }
-            if (c.Style == "panel2") { DrawPanel2(c, label, temp); return; }
+            if (c.IsPanel) { if (c.PanelKind == 2) DrawPanel2(c, label, temp); else DrawPanel(c, label, temp); return; }
             float dpi; using (Graphics sg = Graphics.FromHwnd(IntPtr.Zero)) dpi = sg.DpiX;
             gripPx = (int)(26 * dpi / 96f);
             float sc = Math.Max(30, Math.Min(400, c.Scale)) / 100f;
@@ -592,6 +721,32 @@ namespace TempOverlay
         }
 
 
+        // ---------- placa "NO AR" (vermelha) ----------
+        static string PlateText(Config c, int state) { return state == 1 ? c.AirText : (state == 0 ? "FORA DO AR" : "SEM X32"); }
+        static SizeF PlateSize(Graphics pg, Font f, StringFormat sf, Config c, float k, out float dot)
+        {
+            float w = 0;
+            foreach (int st in new int[] { 1, 0, -1 }) w = Math.Max(w, pg.MeasureString(PlateText(c, st), f, 10000, sf).Width);   // largura fixa
+            float h = pg.MeasureString("Ag", f, 10000, sf).Height;
+            dot = h * 0.42f;
+            return new SizeF(w + dot + 12 * k + 44 * k, h + 24 * k);
+        }
+        static void DrawPlate(Graphics g, Config c, int state, Font f, StringFormat sf, float x, float y, SizeF size, float dot, float k, int alpha)
+        {
+            Color fill = state == 1 ? Color.FromArgb(alpha, 220, 38, 38) : (state == 0 ? Color.FromArgb(alpha, 52, 52, 52) : Color.FromArgb(alpha, 146, 64, 14));
+            Color fg = state == 0 ? Color.FromArgb(alpha, 150, 150, 150) : Color.FromArgb(alpha, 255, 255, 255);
+            using (GraphicsPath gp = Round(Rectangle.Round(new RectangleF(x, y, size.Width, size.Height)), (int)size.Height))
+            using (Brush b = new SolidBrush(fill)) g.FillPath(b, gp);
+            string t = PlateText(c, state);
+            SizeF m = g.MeasureString(t, f, 10000, sf);
+            float cx = x + (size.Width - (dot + 12 * k + m.Width)) / 2;
+            using (Brush bd = new SolidBrush(fg))
+            {
+                g.FillEllipse(bd, cx, y + (size.Height - dot) / 2, dot, dot);
+                g.DrawString(t, f, bd, cx + dot + 12 * k, y + (size.Height - m.Height) / 2, sf);
+            }
+        }
+
         // ---------- estilo Painel: [logo] | relogio + data | icone + temperatura + cidade ----------
         // Largura estavel: mede com o digito mais largo (o "1" e mais estreito e fazia a borda tremer a cada segundo)
         static readonly Dictionary<string, float> widthCache = new Dictionary<string, float>();
@@ -636,7 +791,7 @@ namespace TempOverlay
             string date = now.ToString("dddd, d 'de' MMMM", PtBr); date = char.ToUpper(date[0]) + date.Substring(1);
             bool clock = c.ShowClock, secs = c.ShowClock && c.ShowSeconds, showDate = c.ShowDate;
             bool left = clock || showDate, icon = c.ShowIcon && (WeatherCode >= 0 || ReserveIcon), hasLogo = logo != null;
-            using (Font fClock = Semi(c.FontFamily, F), fSec = Semi(c.FontFamily, F * 0.45f), fTemp = Semi(c.FontFamily, F * 0.85f))
+            using (Font fClock = Semi(c.FontFamily, F), fSec = Semi(c.FontFamily, F * 0.45f), fTemp = Semi(c.FontFamily, F * 0.85f), fAir = Semi(c.FontFamily, Math.Max(10f, F * 0.42f)))
             using (Font fDate = new Font(c.FontFamily, Math.Max(8f, F * 0.30f), FontStyle.Regular, GraphicsUnit.Point))
             using (Font fCity = new Font(c.FontFamily, Math.Max(8f, F * 0.27f), FontStyle.Regular, GraphicsUnit.Point))
             using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
@@ -649,16 +804,17 @@ namespace TempOverlay
                 SizeF mHM = clock ? Fix(M(hm, fClock), MaxW(pg, fClock, sf, "##:##", dpi)) : SizeF.Empty, mSS = secs ? Fix(M(ss, fSec), MaxW(pg, fSec, sf, "##", dpi)) : SizeF.Empty;
                 SizeF mDate = showDate ? M(date, fDate) : SizeF.Empty, mTemp = Fix(M(temp, fTemp), MaxW(pg, fTemp, sf, Pat(temp), dpi)), mCity = M(label, fCity);
                 float gap = 8 * k, ig = 10 * k;
+                float dotA = 0; SizeF plate = c.HasAir ? PlateSize(pg, fAir, sf, c, k, out dotA) : SizeF.Empty;
                 float clockW = mHM.Width + (secs ? gap + mSS.Width : 0);
                 float b1W = Math.Max(clockW, mDate.Width), b1H = mHM.Height + mDate.Height;
                 float iconS = mTemp.Height * 0.72f;
                 float tempW = (icon ? iconS + ig : 0) + mTemp.Width;
                 float b2W = Math.Max(tempW, mCity.Width), b2H = mTemp.Height + mCity.Height;
-                float contentH = Math.Max(left ? b1H : 0, b2H);
+                float contentH = Math.Max(Math.Max(left ? b1H : 0, b2H), plate.Height);
                 float logoH = contentH * 0.95f, logoW = hasLogo ? Math.Min(logo.Width * logoH / logo.Height, contentH * 2.4f) : 0;
                 float padX = 34 * k, padY = 24 * k, side = 40 * k;
-                int sections = 1 + (left ? 1 : 0) + (hasLogo ? 1 : 0);
-                float total = padX * 2 + b2W + (left ? b1W : 0) + logoW + (sections - 1) * (side * 2 + 1);
+                int sections = 1 + (left ? 1 : 0) + (hasLogo ? 1 : 0) + (c.HasAir ? 1 : 0);
+                float total = padX * 2 + b2W + (left ? b1W : 0) + logoW + plate.Width + (sections - 1) * (side * 2 + 1);
                 int w = (int)Math.Ceiling(total), h = (int)Math.Ceiling(contentH + padY * 2);
                 using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb))
                 using (Graphics g = Graphics.FromImage(bmp))
@@ -683,6 +839,11 @@ namespace TempOverlay
                         {
                             g.DrawImage(logo, new RectangleF(x, padY + (contentH - logoH) / 2, logoW, logoH));
                             x += logoW + side; divider(x); x += 1 + side;
+                        }
+                        if (c.HasAir)
+                        {
+                            DrawPlate(g, c, AirState, fAir, sf, x, padY + (contentH - plate.Height) / 2, plate, dotA, k, alpha);
+                            x += plate.Width + side; divider(x); x += 1 + side;
                         }
                         if (left)
                         {
@@ -736,9 +897,9 @@ namespace TempOverlay
             string wd = now.ToString("dddd", PtBr); wd = char.ToUpper(wd[0]) + wd.Substring(1);
             string dm = now.ToString("d 'de' MMMM", PtBr);
             bool clock = c.ShowClock, secs = c.ShowClock && c.ShowSeconds, showDate = c.ShowDate;
-            bool right = clock || showDate, icon = c.ShowIcon && (WeatherCode >= 0 || ReserveIcon), hasLogo = logo != null;
+            bool right = clock || showDate || c.HasAir, icon = c.ShowIcon && (WeatherCode >= 0 || ReserveIcon), hasLogo = logo != null;
             string[] city = label.Length > 0 ? SplitMid(label) : new string[0];
-            using (Font fClock = Semi(c.FontFamily, F), fSec = Semi(c.FontFamily, F * 0.45f), fTemp = Semi(c.FontFamily, F * 0.55f))
+            using (Font fClock = Semi(c.FontFamily, F), fSec = Semi(c.FontFamily, F * 0.45f), fTemp = Semi(c.FontFamily, F * 0.55f), fAir = Semi(c.FontFamily, Math.Max(10f, F * 0.40f)))
             using (Font fDate = new Font(c.FontFamily, Math.Max(8f, F * 0.30f), FontStyle.Regular, GraphicsUnit.Point))
             using (Font fCity = new Font(c.FontFamily, Math.Max(8f, F * 0.24f), FontStyle.Regular, GraphicsUnit.Point))
             using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
@@ -754,7 +915,9 @@ namespace TempOverlay
                 SizeF mC1 = city.Length > 0 ? M(city[0], fCity) : SizeF.Empty, mC2 = city.Length > 1 ? M(city[1], fCity) : SizeF.Empty;
                 float gap = 8 * k, ig = 12 * k;
                 float clockW = mHM.Width + (secs ? gap + mSS.Width : 0);
-                float rightW = Math.Max(clockW, Math.Max(mD1.Width, mD2.Width));
+                float dotA = 0; SizeF plate = c.HasAir ? PlateSize(pg, fAir, sf, c, k, out dotA) : SizeF.Empty;
+                float airH = c.HasAir ? plate.Height + 14 * k : 0;
+                float rightW = Math.Max(Math.Max(clockW, Math.Max(mD1.Width, mD2.Width)), plate.Width);
                 float rightH = mHM.Height + mD1.Height + mD2.Height;
                 float iconS = mTemp.Height * 0.7f;
                 float cityW = Math.Max(mC1.Width, mC2.Width), cityH = mC1.Height + mC2.Height;
@@ -762,7 +925,7 @@ namespace TempOverlay
                 float rowH = Math.Max(mTemp.Height, cityH);
                 float Lw = Math.Max(rowW, hasLogo ? Math.Max(mHM.Width * 0.62f, 140 * k) : 0);
                 float logoBoxH = hasLogo ? Lw * 0.55f : 0, gapL = hasLogo ? 24 * k : 0;
-                float contentH = Math.Max(right ? rightH : 0, logoBoxH + gapL + rowH);
+                float contentH = Math.Max(right ? rightH + airH : 0, logoBoxH + gapL + rowH);
                 float padX = 44 * k, padY = 36 * k, side = 40 * k;
                 float total = padX * 2 + Lw + (right ? side * 2 + 1 + rightW : 0);
                 int w = (int)Math.Ceiling(total), h = (int)Math.Ceiling(contentH + padY * 2);
@@ -804,7 +967,8 @@ namespace TempOverlay
                     {
                         float dx = padX + Lw + side;
                         using (Pen dv = new Pen(Color.FromArgb(alpha, 42, 42, 42), 1)) g.DrawLine(dv, dx, padY, dx, padY + contentH);
-                        float rx = dx + 1 + side, y = padY + (contentH - rightH) / 2;
+                        float rx = dx + 1 + side, y = padY + (contentH - rightH - airH) / 2;
+                        if (c.HasAir) { DrawPlate(g, c, AirState, fAir, sf, rx, y, plate, dotA, k, alpha); y += airH; }
                         if (clock)
                         {
                             using (Brush bm = new SolidBrush(main)) g.DrawString(hm, fClock, bm, rx, y, sf);
@@ -929,6 +1093,9 @@ namespace TempOverlay
         double? value;
         int code = -1;
         string logoPath = null;
+        volatile bool exiting;
+        volatile int airState = -1;
+        readonly AutoResetEvent airWake = new AutoResetEvent(false);
         DateTime t0 = DateTime.Now, nextRetry = DateTime.MinValue, lastFetch = DateTime.MinValue;
         bool fetching, updating;
         readonly bool firstRun = !File.Exists(Config.FilePath);
@@ -954,6 +1121,7 @@ namespace TempOverlay
             menu.Opening += delegate { miLock.Checked = Cfg.Locked; };
             ni.ContextMenuStrip = menu;
             tmr.Interval = 3000; tmr.Tick += delegate { Tick(); }; tmr.Start();
+            Thread airThread = new Thread(AirLoop); airThread.IsBackground = true; airThread.Name = "x32"; airThread.Start();
             Render(); Refresh(true);
             if (firstRun || (Cfg.Source == "city" && !Cfg.Lat.HasValue)) OpenSettings();
             Win.Trim();
@@ -965,9 +1133,26 @@ namespace TempOverlay
         }
         protected override void ExitThreadCore()
         {
+            exiting = true; airWake.Set();
             ni.Visible = false; ni.Dispose(); Ov.Dispose();
             base.ExitThreadCore();
         }
+
+        // consulta a X32 em segundo plano; so redesenha quando o estado muda
+        void AirLoop()
+        {
+            int last = -99;
+            while (!exiting)
+            {
+                string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim();
+                bool active = Cfg.HasAir && ip.Length > 0;
+                int st = -1;
+                if (active) { try { st = X32.State(ip, Cfg.AirChannels, Cfg.AirFader); } catch { st = -1; } }
+                if (st != last) { last = st; airState = st; Post(delegate { Render(); }); }
+                airWake.WaitOne(active ? 800 : 2000);
+            }
+        }
+        public void WakeAir() { airWake.Set(); }
 
         public void ApplyLock()
         {
@@ -1006,6 +1191,8 @@ namespace TempOverlay
             bool fast = Cfg.IsPanel && Cfg.ShowClock;
             int want = fast ? 1000 : 3000;
             if (tmr.Interval != want) tmr.Interval = want;
+            Ov.AirState = airState;
+            ni.Text = (Cfg.HasAir && Cfg.AirIp.Trim().Length > 0 && airState < 0) ? "TempOverlay - X32 sem resposta" : Const.App;
             Ov.WeatherCode = Cfg.Lat.HasValue ? code : -1;
             Ov.ReserveIcon = Cfg.Lat.HasValue;   // reserva o espaco do icone para o painel nao mudar de tamanho quando ele chega
             Ov.Draw(Cfg, LabelText(), TempText()); Ov.KeepOnTop();
@@ -1139,7 +1326,8 @@ namespace TempOverlay
         NumericUpDown nudRef, nudDec, nudSize;
         TrackBar tbOpacity;
         CheckBox chkLabel, chkLock, chkAuto, chkUpd, chkClock, chkSec, chkDate, chkIcon;
-        RadioButton rbPanel, rbPanel2;
+        RadioButton rbPanel, rbPanel2, rbPanelAir, rbPanel2Air;
+        TextBox tbAirIp, tbAirCh, tbAirText; CheckBox chkAirFader; Label lblAirTest;
         TextBox tbLogo; Button btnLogo; NumericUpDown nudScale;
 
         public SettingsForm(AppCtx a)
@@ -1150,16 +1338,16 @@ namespace TempOverlay
             FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; TopMost = true;
             StartPosition = FormStartPosition.CenterScreen; BackColor = Base; ForeColor = Ink;
             AutoScaleMode = AutoScaleMode.Dpi; AutoScaleDimensions = new SizeF(96f, 96f);
-            ClientSize = new Size(460, 540); KeyPreview = true;
+            ClientSize = new Size(460, 570); KeyPreview = true;
             KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) { Cancel(); } };
             FormClosing += delegate(object s, FormClosingEventArgs e) { if (e.CloseReason == CloseReason.UserClosing && !saved) RestoreSnap(); };
 
             sel = c.Lat.HasValue ? new Place { Name = c.CityName, Desc = c.CityDesc, Lat = c.Lat.Value, Lon = c.Lon.Value } : null;
 
-            TabControl tabs = new TabControl { Left = 12, Top = 12, Width = 436, Height = 470 };
-            TabPage t1 = Page("Fonte"), t2 = Page("Aparência"), t3 = Page("Geral");
-            tabs.TabPages.AddRange(new TabPage[] { t1, t2, t3 });
-            int startTab; if (int.TryParse(Environment.GetEnvironmentVariable("TEMPOVERLAY_TAB"), out startTab) && startTab >= 0 && startTab < 3) tabs.SelectedIndex = startTab; // (teste)
+            TabControl tabs = new TabControl { Left = 12, Top = 12, Width = 436, Height = 500 };
+            TabPage t1 = Page("Fonte"), t2 = Page("Aparência"), t3 = Page("Geral"), t4 = Page("NO AR");
+            tabs.TabPages.AddRange(new TabPage[] { t1, t2, t3, t4 });
+            int startTab; if (int.TryParse(Environment.GetEnvironmentVariable("TEMPOVERLAY_TAB"), out startTab) && startTab >= 0 && startTab < 4) tabs.SelectedIndex = startTab; // (teste)
             Controls.Add(tabs);
 
             // --- fonte ---
@@ -1195,38 +1383,40 @@ namespace TempOverlay
             tbOpacity = new TrackBar { Left = 142, Top = 112, Width = 240, Minimum = 30, Maximum = 100, TickFrequency = 10, Value = Math.Max(30, Math.Min(100, c.Opacity)), AutoSize = false, Height = 28 };
             btnTextColor = Btn("", 150, 150, 60); btnTextColor.BackColor = Overlay.Parse(c.TextColor, Color.White);
             btnCardColor = Btn("", 150, 182, 60); btnCardColor.BackColor = Overlay.Parse(c.CardColor, Color.Black);
-            rbTransp = Rad("Transparente", c.Style != "card" && c.Style != "panel" && c.Style != "panel2");
+            rbTransp = Rad("Texto", c.Style != "card" && !c.IsPanel);
             rbCard = Rad("Cartão", c.Style == "card");
             rbPanel = Rad("Painel 1", c.Style == "panel");
             rbPanel2 = Rad("Painel 2", c.Style == "panel2");
-            FlowLayoutPanel flowStyle = new FlowLayoutPanel { Left = 62, Top = 212, Width = 372, Height = 30, WrapContents = false, BackColor = Base };
-            flowStyle.Controls.AddRange(new Control[] { rbTransp, rbCard, rbPanel, rbPanel2 });
+            rbPanelAir = Rad("Painel 1 + NO AR", c.Style == "panel_air");
+            rbPanel2Air = Rad("Painel 2 + NO AR", c.Style == "panel2_air");
+            FlowLayoutPanel flowStyle = new FlowLayoutPanel { Left = 62, Top = 212, Width = 372, Height = 58, WrapContents = true, BackColor = Base };
+            flowStyle.Controls.AddRange(new Control[] { rbTransp, rbCard, rbPanel, rbPanel2, rbPanelAir, rbPanel2Air });
             EventHandler darker = delegate
             {
-                if ((rbPanel.Checked || rbPanel2.Checked) && Hex(btnCardColor.BackColor) == "#101820") btnCardColor.BackColor = Color.FromArgb(13, 13, 13);
+                if ((rbPanel.Checked || rbPanel2.Checked || rbPanelAir.Checked || rbPanel2Air.Checked) && Hex(btnCardColor.BackColor) == "#101820") btnCardColor.BackColor = Color.FromArgb(13, 13, 13);
             };
-            rbPanel.CheckedChanged += darker; rbPanel2.CheckedChanged += darker;
+            rbPanel.CheckedChanged += darker; rbPanel2.CheckedChanged += darker; rbPanelAir.CheckedChanged += darker; rbPanel2Air.CheckedChanged += darker;
             chkClock = Chk("Relógio", c.ShowClock); chkSec = Chk("Segundos", c.ShowSeconds);
             chkDate = Chk("Data", c.ShowDate); chkIcon = Chk("Ícone do clima", c.ShowIcon);
-            FlowLayoutPanel flowPanel = new FlowLayoutPanel { Left = 14, Top = 338, Width = 410, Height = 56, BackColor = Base };
+            FlowLayoutPanel flowPanel = new FlowLayoutPanel { Left = 14, Top = 366, Width = 410, Height = 56, BackColor = Base };
             flowPanel.Controls.AddRange(new Control[] { chkClock, chkSec, chkDate, chkIcon });
-            tbLogo = new TextBox { Left = 60, Top = 404, Width = 252, Text = c.LogoPath };
-            btnLogo = Btn("Escolher", 322, 402, 90);
+            tbLogo = new TextBox { Left = 60, Top = 432, Width = 252, Text = c.LogoPath };
+            btnLogo = Btn("Escolher", 322, 430, 90);
             btnLogo.Click += delegate
             {
                 using (OpenFileDialog d = new OpenFileDialog { Filter = "Imagens|*.png;*.jpg;*.jpeg;*.bmp;*.gif|Todos|*.*", Title = "Logo da rádio" })
                     if (d.ShowDialog(this) == DialogResult.OK) tbLogo.Text = d.FileName;
             };
-            chkLabel = Chk("Mostrar rótulo", c.ShowLabel); chkLabel.Left = 14; chkLabel.Top = 256;
-            tbLabel = new TextBox { Left = 170, Top = 254, Width = 236, Text = c.Label };
-            Label h2 = Lbl("Rótulo vazio = nome da cidade.", 170, 282, 250); h2.ForeColor = Ink2;
+            chkLabel = Chk("Mostrar rótulo", c.ShowLabel); chkLabel.Left = 14; chkLabel.Top = 284;
+            tbLabel = new TextBox { Left = 170, Top = 282, Width = 236, Text = c.Label };
+            Label h2 = Lbl("Rótulo vazio = nome da cidade.", 170, 310, 250); h2.ForeColor = Ink2;
             btnTextColor.Click += delegate { PickColor(btnTextColor); };
             btnCardColor.Click += delegate { PickColor(btnCardColor); };
             t2.Controls.AddRange(new Control[] { Lbl("Sufixo", 14, 19, 120), tbSuffix, Lbl("Casas decimais", 14, 51, 120), nudDec,
                 Lbl("Tamanho da fonte", 14, 83, 130), nudSize, Lbl("Escala (%)", 240, 83, 76), nudScale, Lbl("Opacidade", 14, 117, 120), tbOpacity,
                 Lbl("Cor do texto", 14, 155, 120), btnTextColor, Lbl("Cor do cartão", 14, 187, 120), btnCardColor,
                 Lbl("Estilo", 14, 218, 48), flowStyle, chkLabel, tbLabel, h2,
-                Lbl("Mostrar no painel:", 14, 314, 300), flowPanel, Lbl("Logo", 14, 407, 44), tbLogo, btnLogo });
+                Lbl("Mostrar no painel:", 14, 342, 300), flowPanel, Lbl("Logo", 14, 435, 44), tbLogo, btnLogo });
 
             // --- geral ---
             chkLock = new CheckBox { Text = "Travar posição (os cliques passam por cima do painel)", Left = 14, Top = 16, Width = 380, Checked = c.Locked };
@@ -1237,8 +1427,31 @@ namespace TempOverlay
             h3.Height = 52; h3.ForeColor = Ink2;
             t3.Controls.AddRange(new Control[] { chkLock, chkAuto, chkUpd, btnUpd, h3 });
 
+            // --- NO AR (Behringer X32) ---
+            Label hA = Lbl("Usado nos estilos \"+ NO AR\" (aba Aparência).", 14, 14, 380); hA.ForeColor = Ink2;
+            tbAirIp = new TextBox { Left = 14, Top = 66, Width = 200, Text = c.AirIp };
+            tbAirCh = new TextBox { Left = 14, Top = 124, Width = 400, Text = c.AirChannels };
+            Label hC = Lbl("Ex.: 1 (microfone), 1,2,5, aux1, bus3, main, dca2. O aviso acende se qualquer um dos canais estiver aberto.", 14, 152, 380);
+            hC.ForeColor = Ink2; hC.Height = 40;
+            chkAirFader = new CheckBox { Text = "Considerar o fader (aberto se acima de -60 dB)", Left = 14, Top = 198, Width = 380, Checked = c.AirFader };
+            tbAirText = new TextBox { Left = 14, Top = 266, Width = 200, Text = c.AirText };
+            Button btnAirTest = Btn("Testar conexão", 14, 304, 150);
+            lblAirTest = new Label { Left = 14, Top = 342, Width = 380, Height = 100, Text = "", ForeColor = Ink };
+            btnAirTest.Click += delegate
+            {
+                string ip = tbAirIp.Text.Trim(), ch = tbAirCh.Text;
+                lblAirTest.ForeColor = Ink2; lblAirTest.Text = "Consultando a mesa...";
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    string r; try { r = X32.Describe(ip, ch); } catch (Exception ex) { r = "Erro: " + ex.Message; }
+                    try { BeginInvoke((Action)delegate { lblAirTest.ForeColor = r.StartsWith("Conectado") ? Color.FromArgb(0x16, 0x65, 0x34) : Ink; lblAirTest.Text = r; }); } catch { }
+                });
+            };
+            t4.Controls.AddRange(new Control[] { hA, Lbl("IP da mesa X32 (ex.: 192.168.0.50)", 14, 44, 400), tbAirIp,
+                Lbl("Canais", 14, 102, 400), tbAirCh, hC, chkAirFader, Lbl("Texto do aviso quando no ar", 14, 244, 380), tbAirText, btnAirTest, lblAirTest });
+
             // --- rodape ---
-            Button bc = Btn("Cancelar", 150, 492, 90), ba = Btn("Aplicar", 248, 492, 90), bs = Btn("Salvar", 346, 492, 100);
+            Button bc = Btn("Cancelar", 150, 522, 90), ba = Btn("Aplicar", 248, 522, 90), bs = Btn("Salvar", 346, 522, 100);
             bs.BackColor = Orange; bs.FlatAppearance.BorderColor = Orange; bs.Font = new Font(Font, FontStyle.Bold);
             bc.Click += delegate { Cancel(); }; ba.Click += delegate { Save(false); }; bs.Click += delegate { Save(true); };
             AcceptButton = bs;
@@ -1247,7 +1460,7 @@ namespace TempOverlay
             // previa ao vivo da aparencia
             EventHandler live = delegate { Preview(); };
             tbSuffix.TextChanged += live; nudDec.ValueChanged += live; nudSize.ValueChanged += live; tbOpacity.ValueChanged += live;
-            rbCard.CheckedChanged += live; rbPanel.CheckedChanged += live; rbPanel2.CheckedChanged += live; chkClock.CheckedChanged += live; chkSec.CheckedChanged += live;
+            rbCard.CheckedChanged += live; rbPanel.CheckedChanged += live; rbPanel2.CheckedChanged += live; rbPanelAir.CheckedChanged += live; rbPanel2Air.CheckedChanged += live; chkClock.CheckedChanged += live; chkSec.CheckedChanged += live;
             chkDate.CheckedChanged += live; chkIcon.CheckedChanged += live; tbLogo.TextChanged += live; chkLabel.CheckedChanged += live; tbLabel.TextChanged += live; chkLock.CheckedChanged += live;
             SourceState();
             loading = false;
@@ -1333,7 +1546,7 @@ namespace TempOverlay
         {
             c.Suffix = tbSuffix.Text; c.Decimals = (int)nudDec.Value; c.FontSize = (int)nudSize.Value; c.Opacity = tbOpacity.Value;
             c.TextColor = Hex(btnTextColor.BackColor); c.CardColor = Hex(btnCardColor.BackColor);
-            c.Style = rbPanel2.Checked ? "panel2" : (rbPanel.Checked ? "panel" : (rbCard.Checked ? "card" : "transparent"));
+            c.Style = rbPanel2Air.Checked ? "panel2_air" : (rbPanelAir.Checked ? "panel_air" : (rbPanel2.Checked ? "panel2" : (rbPanel.Checked ? "panel" : (rbCard.Checked ? "card" : "transparent"))));
             c.ShowClock = chkClock.Checked; c.ShowSeconds = chkSec.Checked; c.ShowDate = chkDate.Checked; c.ShowIcon = chkIcon.Checked;
             c.LogoPath = tbLogo.Text.Trim(); c.ShowLabel = chkLabel.Checked; c.Label = tbLabel.Text;
             c.Locked = chkLock.Checked;
@@ -1365,8 +1578,10 @@ namespace TempOverlay
             c.Source = city ? "city" : "txt"; c.TxtPath = tbTxt.Text.Trim(); c.RefreshMin = (int)nudRef.Value;
             if (sel != null) { c.CityName = sel.Name; c.CityDesc = sel.Desc; c.Lat = sel.Lat; c.Lon = sel.Lon; }
             c.Autostart = chkAuto.Checked; c.AutoUpdate = chkUpd.Checked;
+            c.AirIp = tbAirIp.Text.Trim(); c.AirChannels = tbAirCh.Text.Trim().Length == 0 ? "1" : tbAirCh.Text.Trim();
+            c.AirFader = chkAirFader.Checked; c.AirText = tbAirText.Text.Trim().Length == 0 ? "NO AR" : tbAirText.Text.Trim();
             c.Save(); AppCtx.SetAutostart(c.Autostart);
-            snap = c.Clone(); app.ResetValue(); app.ApplyLock(); app.Refresh(true);
+            snap = c.Clone(); app.ResetValue(); app.WakeAir(); app.ApplyLock(); app.Refresh(true);
             if (close) { saved = true; Close(); }
         }
     }
