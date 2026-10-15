@@ -7,4 +7,4 @@ Mostra a temperatura sobreposta a qualquer programa do Windows (útil em softwar
 - Aparência configurável com prévia ao vivo; ícone na bandeja; iniciar com o Windows.
 - Config em `%APPDATA%\TempOverlay\config.json`.
 
-Instalador: veja a página de [Releases](../../releases). Para compilar: `.\build.ps1` (requer Python, PyInstaller e Inno Setup 6).
+Instalador: veja a página de [Releases](../../releases). App nativo (.NET Framework, já incluso no Windows 10/11), ~5 MB de RAM. Para compilar: `.build.ps1` (requer apenas o Inno Setup 6).

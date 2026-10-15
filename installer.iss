@@ -1,6 +1,6 @@
 ; TempOverlay - Inno Setup. Compilar: ISCC.exe installer.iss (depois do build.ps1)
 #define AppName    "TempOverlay"
-#define AppVersion "1.0.0"
+#define AppVersion "1.2.0"
 #define AppPublisher "lnpti"
 #define AppURL     "https://github.com/lnpti/TempOverlay"
 #define AppExe     "TempOverlay.exe"
@@ -38,7 +38,7 @@ Name: "desktopicon"; Description: "Criar atalho na Área de Trabalho"; GroupDesc
 Name: "startup"; Description: "Iniciar com o Windows"; GroupDescription: "Opções:"
 
 [Files]
-Source: "dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "bin\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -49,6 +49,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Abrir o TempOverlay agora"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "KillApp"

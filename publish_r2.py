@@ -26,7 +26,7 @@ def load_env():
 
 def main():
     load_env()
-    version = re.search(r'VERSION = "([^"]+)"', open(os.path.join(HERE, "tempoverlay.py"), encoding="utf-8").read()).group(1)
+    version = re.search(r'Version = "([^"]+)"', open(os.path.join(HERE, "TempOverlay.cs"), encoding="utf-8").read()).group(1)
     name = f"TempOverlay_Setup_v{version}.exe"
     path = os.path.join(HERE, "dist", name)
     if not os.path.exists(path):

@@ -1,6 +1,7 @@
-# Gera dist\TempOverlay.exe e o instalador dist\TempOverlay_Setup_v<versao>.exe
+# Compila bin\TempOverlay.exe (csc do proprio Windows, sem instalar nada) e gera o instalador dist\TempOverlay_Setup_v<versao>.exe
 $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
-python -m PyInstaller --noconfirm --onefile --windowed --name TempOverlay --icon assets\icon.ico tempoverlay.py
+New-Item -ItemType Directory -Force bin | Out-Null
+& "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /optimize+ /win32icon:assets\icon.ico /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:bin\TempOverlay.exe TempOverlay.cs
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-Write-Host "Pronto: dist\"
+Write-Host "Pronto: bin\ e dist\"

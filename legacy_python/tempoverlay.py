@@ -9,7 +9,10 @@ import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -21,7 +24,10 @@ import pystray
 from PIL import Image, ImageDraw
 
 APP = "TempOverlay"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+GITHUB_REPO = "lnpti/TempOverlay"
+R2_MANIFEST = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json"
+UPDATE_HOUR = 3  # checagem de madrugada (alem de a cada 24h)
 KEY_COLOR = "#010101"  # cor tornada transparente (estilo "Transparente")
 CFG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP)
 CFG_FILE = os.path.join(CFG_DIR, "config.json")
@@ -49,6 +55,8 @@ DEFAULTS = {
     "x": 40,
     "y": 40,
     "autostart": False,
+    "auto_update": True,
+    "last_update_check": 0,
 }
 
 
@@ -96,6 +104,40 @@ def fetch_city_temp(lat, lon):
     q = urllib.parse.urlencode({"latitude": lat, "longitude": lon, "current": "temperature_2m"})
     data = http_json("https://api.open-meteo.com/v1/forecast?" + q)
     return float(data["current"]["temperature_2m"])
+
+
+def _ver(s):
+    return tuple(int(x) for x in re.findall(r"\d+", s)[:3])
+
+
+def latest_release():
+    """(versao, url do instalador): GitHub primeiro, espelho R2 se o GitHub falhar."""
+    try:
+        d = http_json(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", 15)
+        a = next(x for x in d["assets"] if x["name"].lower().endswith(".exe") and "setup" in x["name"].lower())
+        return d["tag_name"].lstrip("v"), a["browser_download_url"]
+    except Exception:
+        d = http_json(R2_MANIFEST, 15)
+        return d["version"], d["installer_url"]
+
+
+def download_installer(url):
+    dest = os.path.join(tempfile.mkdtemp(prefix="tempoverlay_upd_"), "TempOverlay_Setup.exe")
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+    with open(dest, "rb") as f:
+        ok = f.read(2) == b"MZ"
+    if not ok or os.path.getsize(dest) < 1_000_000:
+        raise ValueError("download invalido")
+    return dest
+
+
+def run_installer_silent(path):
+    # PYINSTALLER_RESET_ENVIRONMENT: o app reaberto pelo instalador nao pode herdar o _MEIPASS deste processo
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+    subprocess.Popen([path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
+                     env=env, close_fds=True, creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_GROUP
 
 
 _NUM = re.compile(r"-?\d+(?:[.,]\d+)?")
@@ -178,6 +220,9 @@ class App:
         self.fetching = False
         self.settings = None
         self.drag = (0, 0)
+        self.t0 = time.time()
+        self.updating = False
+        self.upd_retry_at = 0.0
 
         self.root = tk.Tk()
         self.root.title(APP)
@@ -195,6 +240,7 @@ class App:
             pystray.MenuItem("Configurações", lambda: self.q.put(self.open_settings), default=True),
             pystray.MenuItem("Travar posição (cliques passam)", lambda: self.q.put(self.toggle_lock),
                              checked=lambda i: bool(self.cfg["locked"])),
+            pystray.MenuItem("Verificar atualização do app", lambda: self.q.put(lambda: self.check_update(manual=True))),
             pystray.MenuItem("Atualizar agora", lambda: self.q.put(lambda: self.refresh(force=True))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", lambda: self.q.put(self.quit)),
@@ -315,8 +361,55 @@ class App:
             self.q.put(done)
         threading.Thread(target=work, daemon=True).start()
 
+    def update_due(self):
+        if not self.cfg["auto_update"] or self.updating or time.time() < self.upd_retry_at:
+            return False
+        if time.time() - self.t0 < 30:
+            return False
+        now, last = time.time(), self.cfg["last_update_check"]
+        if now - last >= 24 * 3600:
+            return True
+        day = lambda t: time.strftime("%Y%m%d", time.localtime(t))
+        return time.localtime(now).tm_hour == UPDATE_HOUR and day(now) != day(last)
+
+    def check_update(self, manual=False):
+        if self.updating:
+            return
+        if not getattr(sys, "frozen", False):
+            if manual:
+                messagebox.showinfo(APP, "Atualização automática só funciona na versão instalada.")
+            return
+        self.updating = True
+
+        def finish(msg=None, retry=False, installer=None):
+            self.updating = False
+            if retry:
+                self.upd_retry_at = time.time() + 1800
+            else:
+                self.cfg["last_update_check"] = time.time()
+                save_cfg(self.cfg)
+            if installer:
+                run_installer_silent(installer)
+                self.root.after(600, self.quit)
+            elif msg and manual:
+                messagebox.showinfo(APP, msg)
+
+        def work():
+            try:
+                ver, url = latest_release()
+                if _ver(ver) <= _ver(VERSION):
+                    self.q.put(lambda: finish(f"Você já está na versão mais recente ({VERSION})."))
+                    return
+                path = download_installer(url)
+                self.q.put(lambda: finish(installer=path))
+            except Exception:
+                self.q.put(lambda: finish("Não foi possível verificar agora (sem internet?).", retry=True))
+        threading.Thread(target=work, daemon=True).start()
+
     def tick(self):
         self.refresh()
+        if self.update_due():
+            self.check_update()
         self.root.attributes("-topmost", True)
         self.root.lift()
         self.root.after(TICK_MS if self.cfg["source"] == "city" else 3000, self.tick)
@@ -329,88 +422,21 @@ class App:
             pass
         self.root.after(150, self.poll_queue)
 
-    # ----- configuracoes (tokens do ui-ux-pro-max: dark audio + acento quente, grid 8px) -----
-    T = {
-        "bg": "#0F0F23", "surface": "#1B1B33", "muted": "#27273B", "border": "#3A3A5C",
-        "fg": "#F8FAFC", "fg2": "#B4B7D3", "accent": "#F97316", "on_accent": "#0F0F23",
-        "focus": "#818CF8", "ok": "#4ADE80", "font": "Segoe UI",
-    }
-
-    def init_styles(self):
-        T = self.T
-        s = ttk.Style(self.root)
-        s.theme_use("clam")
-        f = (T["font"], 10)
-        s.configure(".", background=T["surface"], foreground=T["fg"], font=f, bordercolor=T["border"],
-                    lightcolor=T["surface"], darkcolor=T["surface"], focuscolor=T["focus"])
-        s.configure("TFrame", background=T["surface"])
-        s.configure("Root.TFrame", background=T["bg"])
-        s.configure("TLabel", background=T["surface"], foreground=T["fg"])
-        s.configure("Hint.TLabel", foreground=T["fg2"], font=(T["font"], 9))
-        s.configure("Ok.TLabel", foreground=T["ok"])
-        s.configure("Title.TLabel", background=T["bg"], font=(T["font"], 16, "bold"))
-        s.configure("Sub.TLabel", background=T["bg"], foreground=T["fg2"])
-        s.configure("Sec.TLabel", foreground=T["fg2"], font=(T["font"], 9, "bold"))
-        s.configure("TSeparator", background=T["border"])
-        for w in ("TEntry", "TSpinbox"):
-            s.configure(w, fieldbackground=T["muted"], foreground=T["fg"], insertcolor=T["fg"],
-                        bordercolor=T["border"], padding=6, arrowcolor=T["fg"])
-            s.map(w, bordercolor=[("focus", T["focus"])], fieldbackground=[("disabled", T["surface"])],
-                  foreground=[("disabled", T["fg2"])])
-        s.configure("TButton", background=T["muted"], foreground=T["fg"], padding=(14, 7), borderwidth=1,
-                    bordercolor=T["border"])
-        s.map("TButton", background=[("active", "#34345A"), ("disabled", T["surface"])],
-              foreground=[("disabled", T["fg2"])], bordercolor=[("focus", T["focus"])])
-        s.configure("Accent.TButton", background=T["accent"], foreground=T["on_accent"],
-                    font=(T["font"], 10, "bold"), bordercolor=T["accent"])
-        s.map("Accent.TButton", background=[("active", "#FB923C")], bordercolor=[("focus", T["focus"])])
-        for w in ("TRadiobutton", "TCheckbutton"):
-            s.configure(w, background=T["surface"], foreground=T["fg"], indicatorcolor=T["muted"],
-                        indicatorbackground=T["muted"])
-            s.map(w, background=[("active", T["surface"])], indicatorcolor=[("selected", T["accent"])],
-                  foreground=[("disabled", T["fg2"])])
-        s.configure("Horizontal.TScale", background=T["surface"], troughcolor=T["muted"])
-
-    def section(self, parent, title):
-        T = self.T
-        box = tk.Frame(parent, bg=T["surface"], highlightthickness=1, highlightbackground=T["border"])
-        box.pack(fill="x", pady=(0, 16))
-        inner = ttk.Frame(box, padding=16)
-        inner.pack(fill="x")
-        ttk.Label(inner, text=title.upper(), style="Sec.TLabel").grid(row=0, column=0, columnspan=4,
-                                                                     sticky="w", pady=(0, 8))
-        return inner
-
-    def swatch(self, parent, attr, row, col, label):
-        T = self.T
-        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", padx=(0, 8), pady=4)
-        b = tk.Button(parent, width=4, relief="flat", bd=0, cursor="hand2", bg=getattr(self, attr),
-                      activebackground=getattr(self, attr), highlightthickness=1,
-                      highlightbackground=T["border"], highlightcolor=T["focus"])
-        b.grid(row=row, column=col + 1, sticky="w", pady=4, padx=(0, 16))
-
-        def pick():
-            c = colorchooser.askcolor(color=getattr(self, attr), parent=self.settings)[1]
-            if c:
-                setattr(self, attr, c)
-                b.configure(bg=c, activebackground=c)
-                self.preview()
-        b.configure(command=pick)
-        return b
-
+    # ----- configuracoes: Neumorphism claro (ui-ux-pro-max), ver neu.py -----
     def open_settings(self):
         if self.settings and self.settings.winfo_exists():
             self.settings.deiconify()
             self.settings.lift()
             return
-        T = self.T
+        import neu
+        from neu import NeuBox, NeuButton, NeuCheck, NeuEntry, NeuListbox, NeuSpin, NeuSwatch, groove, label, px
+        neu.set_scale(self.root.winfo_fpixels("1i") / 96)
         c = self.cfg
-        self.init_styles()
         self._snap = dict(c)
         self._prev_job = None
         w = self.settings = tk.Toplevel(self.root)
         w.title(f"{APP} - Configurações")
-        w.configure(bg=T["bg"])
+        w.configure(bg=neu.BASE)
         w.resizable(False, False)
         w.attributes("-topmost", True)
         w.bind("<Escape>", lambda e: self.cancel_settings())
@@ -431,103 +457,133 @@ class App:
         self.var_opacity = tk.IntVar(value=c["opacity"])
         self.var_locked = tk.BooleanVar(value=c["locked"])
         self.var_autostart = tk.BooleanVar(value=c["autostart"])
+        self.var_autoupd = tk.BooleanVar(value=c["auto_update"])
         self.text_color = c["text_color"]
         self.card_color = c["card_color"]
 
-        outer = ttk.Frame(w, style="Root.TFrame", padding=24)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="TempOverlay", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text="Temperatura sobreposta a qualquer programa da tela.",
-                  style="Sub.TLabel").pack(anchor="w", pady=(0, 16))
+        outer = tk.Frame(w, bg=neu.BASE)
+        outer.pack(padx=px(24), pady=px(20))
+        label(outer, "TempOverlay", "title").grid(row=0, column=0, sticky="w", padx=px(8))
+        label(outer, "Temperatura sobreposta a qualquer programa da tela.", "sub").grid(
+            row=1, column=0, sticky="w", padx=px(8), pady=(0, px(8)))
 
-        # --- fonte ---
-        src = self.section(outer, "Fonte da temperatura")
-        ttk.Radiobutton(src, text="Cidade (internet)", variable=self.var_source, value="city",
-                        command=self.toggle_source).grid(row=1, column=0, columnspan=4, sticky="w")
-        ttk.Label(src, text="Cidade").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.e_city = ttk.Entry(src, textvariable=self.var_city_q, width=34)
-        self.e_city.grid(row=3, column=0, columnspan=3, sticky="ew", padx=(0, 8))
+        tabs = tk.Frame(outer, bg=neu.BASE)
+        tabs.grid(row=2, column=0, sticky="w")
+        card = NeuBox(outer, "raised", radius=20, margin=12, pad=16, off=6, blur=10)
+        card.grid(row=3, column=0, sticky="ew")
+        names = ("Fonte", "Aparência", "Geral")
+        pages = [tk.Frame(card.body, bg=neu.BASE) for _ in names]
+        btns = []
+        for i, n in enumerate(names):
+            pages[i].grid(row=0, column=0, sticky="nsew")
+
+            def show(i=i):
+                pages[i].tkraise()
+                for j, b in enumerate(btns):
+                    b.set_selected(j == i)
+            b = NeuButton(tabs, n, show, margin=8, pad=4, width=10)
+            b.grid(row=0, column=i)
+            btns.append(b)
+        src, vis, misc = pages
+        pw = px(6)
+
+        # --- Fonte ---
+        NeuCheck(src, "Cidade (internet)", self.var_source, "city", self.toggle_source).grid(
+            row=0, column=0, sticky="w", pady=(0, pw))
+        label(src, "Cidade").grid(row=1, column=0, sticky="w", padx=px(6))
+        rowc = tk.Frame(src, bg=neu.BASE)
+        rowc.grid(row=2, column=0, sticky="w")
+        self.e_city = NeuEntry(rowc, textvariable=self.var_city_q, width=32)
+        self.e_city.grid(row=0, column=0)
         self.e_city.bind("<Return>", lambda ev: self.do_search())
-        self.b_search = ttk.Button(src, text="Buscar", command=self.do_search)
-        self.b_search.grid(row=3, column=3)
-        self.lst = tk.Listbox(src, height=4, width=52, exportselection=False, bg=T["muted"], fg=T["fg"],
-                              selectbackground=T["accent"], selectforeground=T["on_accent"], relief="flat",
-                              highlightthickness=1, highlightbackground=T["border"],
-                              highlightcolor=T["focus"], font=(T["font"], 10), activestyle="none")
-        self.lst.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.b_search = NeuButton(rowc, "Buscar", self.do_search)
+        self.b_search.grid(row=0, column=1)
+        lbox = NeuListbox(src, height=4, width=44)
+        lbox.grid(row=3, column=0, sticky="w")
+        self.lst = lbox.lb
         self.lst.bind("<<ListboxSelect>>", self.on_pick)
-        self.lbl_sel = ttk.Label(src, text=self.sel_text(),
-                                 style="Ok.TLabel" if self.sel.get("lat") else "Hint.TLabel")
-        self.lbl_sel.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(src, text="Atualizar a cada (min)").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        self.sp_ref = ttk.Spinbox(src, from_=1, to=120, textvariable=self.var_refresh, width=6)
-        self.sp_ref.grid(row=6, column=1, sticky="w", pady=(8, 0))
+        self.lbl_sel = label(src, self.sel_text(), "ok" if self.sel.get("lat") else "hint")
+        self.lbl_sel.grid(row=4, column=0, sticky="w", padx=px(6), pady=(pw, 0))
+        rowr = tk.Frame(src, bg=neu.BASE)
+        rowr.grid(row=5, column=0, sticky="w", pady=(pw, 0))
+        label(rowr, "Atualizar a cada (min)").grid(row=0, column=0, padx=(px(6), px(8)))
+        self.sp_ref = NeuSpin(rowr, self.var_refresh, 1, 120, width=4)
+        self.sp_ref.grid(row=0, column=1)
+        groove(src).grid(row=6, column=0, sticky="ew", pady=px(14), padx=px(6))
+        NeuCheck(src, "Arquivo TXT (só um número, ex.: 27,5)", self.var_source, "txt", self.toggle_source).grid(
+            row=7, column=0, sticky="w", pady=(0, pw))
+        label(src, "Arquivo").grid(row=8, column=0, sticky="w", padx=px(6))
+        rowt = tk.Frame(src, bg=neu.BASE)
+        rowt.grid(row=9, column=0, sticky="w")
+        self.e_txt = NeuEntry(rowt, textvariable=self.var_txt, width=32)
+        self.e_txt.grid(row=0, column=0)
+        self.b_txt = NeuButton(rowt, "Procurar", self.pick_txt)
+        self.b_txt.grid(row=0, column=1)
+        label(src, "O arquivo é relido a cada poucos segundos.", "hint").grid(
+            row=10, column=0, sticky="w", padx=px(6))
 
-        ttk.Separator(src).grid(row=7, column=0, columnspan=4, sticky="ew", pady=16)
-        ttk.Radiobutton(src, text="Arquivo TXT (só um número, ex.: 27,5)", variable=self.var_source,
-                        value="txt", command=self.toggle_source).grid(row=8, column=0, columnspan=4, sticky="w")
-        ttk.Label(src, text="Arquivo").grid(row=9, column=0, sticky="w", pady=(8, 0))
-        self.e_txt = ttk.Entry(src, textvariable=self.var_txt, width=34)
-        self.e_txt.grid(row=10, column=0, columnspan=3, sticky="ew", padx=(0, 8))
-        self.b_txt = ttk.Button(src, text="Procurar", command=self.pick_txt)
-        self.b_txt.grid(row=10, column=3)
-        ttk.Label(src, text="O arquivo é relido a cada poucos segundos.", style="Hint.TLabel").grid(
-            row=11, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        src.columnconfigure(2, weight=1)
+        # --- Aparencia ---
+        label(vis, "Prévia ao vivo no painel da tela.", "hint").grid(row=0, column=0, columnspan=4, sticky="w", padx=px(6))
+        label(vis, "Sufixo").grid(row=1, column=0, sticky="w", padx=px(6))
+        NeuEntry(vis, textvariable=self.var_suffix, width=6).grid(row=1, column=1, sticky="w")
+        label(vis, "Casas decimais").grid(row=1, column=2, sticky="w", padx=(px(16), px(6)))
+        NeuSpin(vis, self.var_dec, 0, 1, width=3).grid(row=1, column=3, sticky="w")
+        label(vis, "Tamanho da fonte").grid(row=2, column=0, sticky="w", padx=px(6))
+        NeuSpin(vis, self.var_size, 12, 300, width=5).grid(row=2, column=1, sticky="w")
+        label(vis, "Opacidade").grid(row=2, column=2, sticky="w", padx=(px(16), px(6)))
+        sc = NeuBox(vis, "inset", radius=10, margin=6, pad=3, off=3, blur=4)
+        sc.grid(row=2, column=3, sticky="w")
+        tk.Scale(sc.body, from_=30, to=100, orient="horizontal", variable=self.var_opacity, showvalue=0,
+                 length=px(130), width=px(12), sliderlength=px(22), bd=0, relief="flat", sliderrelief="flat",
+                 bg=neu.ACCENT, activebackground=neu.ACCENT, troughcolor=neu.BASE, highlightthickness=0).grid()
+        label(vis, "Cor do texto").grid(row=3, column=0, sticky="w", padx=px(6))
+        self.sw_text = NeuSwatch(vis, self.text_color, lambda: self.pick_color("text_color", self.sw_text))
+        self.sw_text.grid(row=3, column=1, sticky="w")
+        label(vis, "Cor do cartão").grid(row=3, column=2, sticky="w", padx=(px(16), px(6)))
+        self.sw_card = NeuSwatch(vis, self.card_color, lambda: self.pick_color("card_color", self.sw_card))
+        self.sw_card.grid(row=3, column=3, sticky="w")
+        label(vis, "Estilo").grid(row=4, column=0, sticky="w", padx=px(6))
+        NeuCheck(vis, "Transparente", self.var_style, "transparent").grid(row=4, column=1, sticky="w", pady=pw)
+        NeuCheck(vis, "Cartão", self.var_style, "card").grid(row=4, column=2, columnspan=2, sticky="w", padx=(px(16), 0))
+        NeuCheck(vis, "Mostrar rótulo", self.var_showlabel).grid(row=5, column=0, sticky="w", pady=(pw, 0))
+        NeuEntry(vis, textvariable=self.var_label, width=24).grid(row=5, column=1, columnspan=3, sticky="w", pady=(pw, 0))
+        label(vis, "Rótulo vazio = nome da cidade.", "hint").grid(row=6, column=1, columnspan=3, sticky="w", padx=px(6))
 
-        # --- aparencia ---
-        vis = self.section(outer, "Aparência (prévia ao vivo)")
-        ttk.Label(vis, text="Sufixo").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(vis, textvariable=self.var_suffix, width=7).grid(row=1, column=1, sticky="w", padx=(0, 16))
-        ttk.Label(vis, text="Casas decimais").grid(row=1, column=2, sticky="w", padx=(0, 8))
-        ttk.Spinbox(vis, from_=0, to=1, textvariable=self.var_dec, width=4).grid(row=1, column=3, sticky="w")
-        ttk.Label(vis, text="Tamanho da fonte").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Spinbox(vis, from_=12, to=300, textvariable=self.var_size, width=7).grid(
-            row=2, column=1, sticky="w", padx=(0, 16))
-        ttk.Label(vis, text="Opacidade").grid(row=2, column=2, sticky="w", padx=(0, 8))
-        ttk.Scale(vis, from_=30, to=100, variable=self.var_opacity, length=120).grid(
-            row=2, column=3, sticky="w")
-        self.swatch(vis, "text_color", 3, 0, "Cor do texto")
-        self.swatch(vis, "card_color", 3, 2, "Cor do cartão")
-        ttk.Label(vis, text="Estilo").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Radiobutton(vis, text="Transparente", variable=self.var_style, value="transparent").grid(
-            row=4, column=1, sticky="w")
-        ttk.Radiobutton(vis, text="Cartão", variable=self.var_style, value="card").grid(
-            row=4, column=2, sticky="w")
-        ttk.Checkbutton(vis, text="Mostrar rótulo", variable=self.var_showlabel).grid(
-            row=5, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(vis, textvariable=self.var_label, width=30).grid(
-            row=5, column=1, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Label(vis, text="Rótulo vazio = nome da cidade.", style="Hint.TLabel").grid(
-            row=6, column=1, columnspan=3, sticky="w", pady=(4, 0))
+        # --- Geral ---
+        NeuCheck(misc, "Travar posição (os cliques passam por cima do painel)", self.var_locked).grid(
+            row=0, column=0, sticky="w", pady=pw)
+        NeuCheck(misc, "Iniciar com o Windows", self.var_autostart).grid(row=1, column=0, sticky="w", pady=pw)
+        NeuCheck(misc, "Atualizar sozinho (a cada 24 h e de madrugada) e reabrir como estava",
+                 self.var_autoupd).grid(row=2, column=0, sticky="w", pady=pw)
+        NeuButton(misc, f"Verificar atualização agora (v{VERSION})",
+                  lambda: self.check_update(manual=True)).grid(row=3, column=0, sticky="w", pady=(px(8), 0))
+        label(misc, "Destravado: arraste o painel (contorno laranja). Para reabrir esta janela, use o ícone "
+                    "perto do relógio.", "hint", wraplength=px(420)).grid(
+            row=4, column=0, sticky="w", padx=px(6), pady=(px(8), 0))
 
-        # --- comportamento ---
-        misc = self.section(outer, "Comportamento")
-        ttk.Checkbutton(misc, text="Travar posição (os cliques passam por cima do painel)",
-                        variable=self.var_locked).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(misc, text="Iniciar com o Windows", variable=self.var_autostart).grid(
-            row=2, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(misc, text="Destravado: arraste o painel (contorno laranja). Para reabrir esta janela, "
-                             "use o ícone perto do relógio.", style="Hint.TLabel", wraplength=470).grid(
-            row=3, column=0, sticky="w", pady=(8, 0))
-
-        # --- rodape: 1 acao primaria ---
-        foot = ttk.Frame(outer, style="Root.TFrame")
-        foot.pack(fill="x")
-        ttk.Button(foot, text="Salvar", style="Accent.TButton",
-                   command=lambda: self.save_settings(close=True)).pack(side="right")
-        ttk.Button(foot, text="Aplicar", command=lambda: self.save_settings(close=False)).pack(
-            side="right", padx=8)
-        ttk.Button(foot, text="Cancelar", command=self.cancel_settings).pack(side="right")
+        # --- rodape: uma unica acao primaria ---
+        foot = tk.Frame(outer, bg=neu.BASE)
+        foot.grid(row=4, column=0, sticky="e", pady=(px(8), 0))
+        NeuButton(foot, "Cancelar", self.cancel_settings).grid(row=0, column=0)
+        NeuButton(foot, "Aplicar", lambda: self.save_settings(close=False)).grid(row=0, column=1)
+        NeuButton(foot, "Salvar", lambda: self.save_settings(close=True), primary=True).grid(row=0, column=2)
 
         for v in (self.var_suffix, self.var_dec, self.var_showlabel, self.var_label, self.var_size,
                   self.var_style, self.var_opacity, self.var_locked):
             v.trace_add("write", lambda *a: self.preview())
+        btns[0].set_selected(True)
         self.toggle_source()
         w.update_idletasks()
         sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
         w.geometry(f"+{(sw - w.winfo_width()) // 2}+{max(10, (sh - w.winfo_height()) // 3)}")
         self.e_city.focus_set()
+
+    def pick_color(self, attr, swatch):
+        c = colorchooser.askcolor(color=getattr(self, attr), parent=self.settings)[1]
+        if c:
+            setattr(self, attr, c)
+            swatch.set_color(c)
+            self.preview()
 
     def toggle_source(self):
         city = self.var_source.get() == "city"
@@ -548,9 +604,9 @@ class App:
             self._prev_job = None
             try:
                 self.cfg.update({
-                    "suffix": self.var_suffix.get(), "decimals": int(self.var_dec.get() or 0),
+                    "suffix": self.var_suffix.get(), "decimals": self._i(self.var_dec, 0),
                     "show_label": bool(self.var_showlabel.get()), "label": self.var_label.get(),
-                    "font_size": max(12, int(self.var_size.get() or 48)), "style": self.var_style.get(),
+                    "font_size": max(12, self._i(self.var_size, 48)), "style": self.var_style.get(),
                     "opacity": int(float(self.var_opacity.get())), "text_color": self.text_color,
                     "card_color": self.card_color, "locked": bool(self.var_locked.get()),
                 })
@@ -570,6 +626,13 @@ class App:
         self.render()
         if self.settings and self.settings.winfo_exists():
             self.settings.destroy()
+
+    @staticmethod
+    def _i(var, default):
+        try:
+            return int(float(var.get()))
+        except (tk.TclError, ValueError):
+            return default
 
     def sel_text(self):
         return ("Selecionada: " + self.sel["desc"]) if self.sel.get("lat") else "Nenhuma cidade selecionada"
@@ -606,7 +669,7 @@ class App:
         s = self.lst.curselection()
         if s and s[0] < len(self.results):
             self.sel = self.results[s[0]]
-            self.lbl_sel.configure(text=self.sel_text(), style="Ok.TLabel")
+            self.lbl_sel.configure(text=self.sel_text(), fg="#166534", font=("Segoe UI", 10, "bold"))
 
     def pick_txt(self):
         p = filedialog.askopenfilename(parent=self.settings, title="Arquivo com a temperatura",
@@ -630,18 +693,19 @@ class App:
             "lat": self.sel.get("lat"),
             "lon": self.sel.get("lon"),
             "txt_path": self.var_txt.get().strip(),
-            "refresh_min": max(1, int(self.var_refresh.get() or 10)),
+            "refresh_min": max(1, self._i(self.var_refresh, 10)),
             "suffix": self.var_suffix.get(),
-            "decimals": int(self.var_dec.get() or 0),
+            "decimals": self._i(self.var_dec, 0),
             "show_label": bool(self.var_showlabel.get()),
             "label": self.var_label.get(),
-            "font_size": max(12, int(self.var_size.get() or 48)),
+            "font_size": max(12, self._i(self.var_size, 48)),
             "text_color": self.text_color,
             "card_color": self.card_color,
             "style": self.var_style.get(),
-            "opacity": int(float(self.var_opacity.get())),
+            "opacity": self._i(self.var_opacity, 100),
             "locked": bool(self.var_locked.get()),
             "autostart": bool(self.var_autostart.get()),
+            "auto_update": bool(self.var_autoupd.get()),
         })
         save_cfg(c)
         set_autostart(c["autostart"])
