@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.2.3.0")]
+[assembly: AssemblyVersion("1.2.4.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.2.3";
+        public const string Version = "1.2.4";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -551,7 +551,7 @@ namespace TempOverlay
                     probe.SetResolution(dpi, dpi);
                     pg.PageUnit = GraphicsUnit.Pixel; pg.SetClip(new Rectangle(0, 0, 1, 1));
                     pg.TextRenderingHint = TextRenderingHint.AntiAlias;
-                    st = pg.MeasureString(temp, ft, 10000, sf);
+                    st = pg.MeasureString(temp, ft, 10000, sf); st = Fix(st, MaxW(pg, ft, sf, Pat(temp), dpi));
                     if (label.Length > 0) sl = pg.MeasureString(label, fl, 10000, sf);
                 }
                 int padX = (int)((card ? 18 : 8) * k), padY = (int)((card ? 10 : 4) * k), gap = label.Length > 0 ? (int)(2 * k) : 0;
@@ -592,6 +592,21 @@ namespace TempOverlay
 
 
         // ---------- estilo Painel: [logo] | relogio + data | icone + temperatura + cidade ----------
+        // Largura estavel: mede com o digito mais largo (o "1" e mais estreito e fazia a borda tremer a cada segundo)
+        static readonly Dictionary<string, float> widthCache = new Dictionary<string, float>();
+        static string Pat(string t) { return Regex.Replace(t, "\\d", "#"); }
+        static SizeF Fix(SizeF s, float w) { return new SizeF(Math.Max(s.Width, w), s.Height); }
+        static float MaxW(Graphics pg, Font f, StringFormat sf, string pattern, float dpi)
+        {
+            string key = f.Name + "|" + f.Size + "|" + pattern + "|" + dpi;
+            float v;
+            if (widthCache.TryGetValue(key, out v)) return v;
+            for (int d = 0; d < 10; d++)
+                v = Math.Max(v, pg.MeasureString(pattern.Replace('#', (char)('0' + d)), f, 10000, sf).Width);
+            widthCache[key] = v;
+            return v;
+        }
+
         static Font Semi(string fam, float pt)
         {
             Font f = new Font("Segoe UI Semibold", pt, FontStyle.Regular, GraphicsUnit.Point);
@@ -630,8 +645,8 @@ namespace TempOverlay
                 sf.FormatFlags |= StringFormatFlags.NoWrap;
                 probe.SetResolution(dpi, dpi); pg.PageUnit = GraphicsUnit.Pixel; pg.TextRenderingHint = TextRenderingHint.AntiAlias;
                 Func<string, Font, SizeF> M = delegate(string t, Font f) { return t.Length == 0 ? SizeF.Empty : pg.MeasureString(t, f, 10000, sf); };
-                SizeF mHM = clock ? M(hm, fClock) : SizeF.Empty, mSS = secs ? M(ss, fSec) : SizeF.Empty;
-                SizeF mDate = showDate ? M(date, fDate) : SizeF.Empty, mTemp = M(temp, fTemp), mCity = M(label, fCity);
+                SizeF mHM = clock ? Fix(M(hm, fClock), MaxW(pg, fClock, sf, "##:##", dpi)) : SizeF.Empty, mSS = secs ? Fix(M(ss, fSec), MaxW(pg, fSec, sf, "##", dpi)) : SizeF.Empty;
+                SizeF mDate = showDate ? M(date, fDate) : SizeF.Empty, mTemp = Fix(M(temp, fTemp), MaxW(pg, fTemp, sf, Pat(temp), dpi)), mCity = M(label, fCity);
                 float gap = 8 * k, ig = 10 * k;
                 float clockW = mHM.Width + (secs ? gap + mSS.Width : 0);
                 float b1W = Math.Max(clockW, mDate.Width), b1H = mHM.Height + mDate.Height;
@@ -732,9 +747,9 @@ namespace TempOverlay
                 sf.FormatFlags |= StringFormatFlags.NoWrap;
                 probe.SetResolution(dpi, dpi); pg.PageUnit = GraphicsUnit.Pixel; pg.TextRenderingHint = TextRenderingHint.AntiAlias;
                 Func<string, Font, SizeF> M = delegate(string t, Font f) { return t.Length == 0 ? SizeF.Empty : pg.MeasureString(t, f, 10000, sf); };
-                SizeF mHM = clock ? M(hm, fClock) : SizeF.Empty, mSS = secs ? M(ss, fSec) : SizeF.Empty;
+                SizeF mHM = clock ? Fix(M(hm, fClock), MaxW(pg, fClock, sf, "##:##", dpi)) : SizeF.Empty, mSS = secs ? Fix(M(ss, fSec), MaxW(pg, fSec, sf, "##", dpi)) : SizeF.Empty;
                 SizeF mD1 = showDate ? M(wd, fDate) : SizeF.Empty, mD2 = showDate ? M(dm, fDate) : SizeF.Empty;
-                SizeF mTemp = M(temp, fTemp);
+                SizeF mTemp = Fix(M(temp, fTemp), MaxW(pg, fTemp, sf, Pat(temp), dpi));
                 SizeF mC1 = city.Length > 0 ? M(city[0], fCity) : SizeF.Empty, mC2 = city.Length > 1 ? M(city[1], fCity) : SizeF.Empty;
                 float gap = 8 * k, ig = 12 * k;
                 float clockW = mHM.Width + (secs ? gap + mSS.Width : 0);
