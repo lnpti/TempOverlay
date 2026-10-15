@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.2.4.0")]
+[assembly: AssemblyVersion("1.2.5.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.2.4";
+        public const string Version = "1.2.5";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -446,6 +446,7 @@ namespace TempOverlay
         public event Action<int> ScaleRequested;
         Bitmap logo;
         public int WeatherCode = -1;
+        public bool ReserveIcon;
         static readonly CultureInfo PtBr = new CultureInfo("pt-BR");
         public void SetLogo(Bitmap b) { if (logo != null) logo.Dispose(); logo = b; }
         public Point Pos = new Point(40, 40); // posicao propria (nao depende de Form.Location)
@@ -634,7 +635,7 @@ namespace TempOverlay
             string hm = now.ToString("HH:mm"), ss = now.ToString("ss");
             string date = now.ToString("dddd, d 'de' MMMM", PtBr); date = char.ToUpper(date[0]) + date.Substring(1);
             bool clock = c.ShowClock, secs = c.ShowClock && c.ShowSeconds, showDate = c.ShowDate;
-            bool left = clock || showDate, icon = c.ShowIcon && WeatherCode >= 0, hasLogo = logo != null;
+            bool left = clock || showDate, icon = c.ShowIcon && (WeatherCode >= 0 || ReserveIcon), hasLogo = logo != null;
             using (Font fClock = Semi(c.FontFamily, F), fSec = Semi(c.FontFamily, F * 0.45f), fTemp = Semi(c.FontFamily, F * 0.85f))
             using (Font fDate = new Font(c.FontFamily, Math.Max(8f, F * 0.30f), FontStyle.Regular, GraphicsUnit.Point))
             using (Font fCity = new Font(c.FontFamily, Math.Max(8f, F * 0.27f), FontStyle.Regular, GraphicsUnit.Point))
@@ -692,14 +693,14 @@ namespace TempOverlay
                                 using (Brush bm = new SolidBrush(main)) g.DrawString(hm, fClock, bm, x0, y, sf);
                                 if (secs)
                                     using (Brush bs = new SolidBrush(grey))
-                                        g.DrawString(ss, fSec, bs, x0 + mHM.Width + gap, y + AscentPx(fClock, dpi) - AscentPx(fSec, dpi), sf);
+                                        g.DrawString(ss, fSec, bs, x0 + pg.MeasureString(hm, fClock, 10000, sf).Width + gap, y + AscentPx(fClock, dpi) - AscentPx(fSec, dpi), sf);
                             }
                             if (showDate)
                                 using (Brush bd = new SolidBrush(grey2)) g.DrawString(date, fDate, bd, x + (b1W - mDate.Width) / 2, y + mHM.Height, sf);
                             x += b1W + side; divider(x); x += 1 + side;
                         }
                         float y2 = padY + (contentH - b2H) / 2, x1 = x + (b2W - tempW) / 2;
-                        if (icon) DrawIcon(g, WeatherCode, x1, y2 + (mTemp.Height - iconS) / 2, iconS, alpha);
+                        if (icon && WeatherCode >= 0) DrawIcon(g, WeatherCode, x1, y2 + (mTemp.Height - iconS) / 2, iconS, alpha);
                         using (Brush bt = new SolidBrush(main)) g.DrawString(temp, fTemp, bt, x1 + (icon ? iconS + ig : 0), y2, sf);
                         if (label.Length > 0)
                             using (Brush bc = new SolidBrush(grey)) g.DrawString(label, fCity, bc, x + (b2W - mCity.Width) / 2, y2 + mTemp.Height, sf);
@@ -735,7 +736,7 @@ namespace TempOverlay
             string wd = now.ToString("dddd", PtBr); wd = char.ToUpper(wd[0]) + wd.Substring(1);
             string dm = now.ToString("d 'de' MMMM", PtBr);
             bool clock = c.ShowClock, secs = c.ShowClock && c.ShowSeconds, showDate = c.ShowDate;
-            bool right = clock || showDate, icon = c.ShowIcon && WeatherCode >= 0, hasLogo = logo != null;
+            bool right = clock || showDate, icon = c.ShowIcon && (WeatherCode >= 0 || ReserveIcon), hasLogo = logo != null;
             string[] city = label.Length > 0 ? SplitMid(label) : new string[0];
             using (Font fClock = Semi(c.FontFamily, F), fSec = Semi(c.FontFamily, F * 0.45f), fTemp = Semi(c.FontFamily, F * 0.55f))
             using (Font fDate = new Font(c.FontFamily, Math.Max(8f, F * 0.30f), FontStyle.Regular, GraphicsUnit.Point))
@@ -789,7 +790,7 @@ namespace TempOverlay
                     }
                     float ry = hasLogo ? padY + contentH - rowH : padY + (contentH - rowH) / 2;
                     float x = padX;
-                    if (icon) { DrawIcon(g, WeatherCode, x, ry + (rowH - iconS) / 2, iconS, alpha); x += iconS + ig; }
+                    if (icon) { if (WeatherCode >= 0) DrawIcon(g, WeatherCode, x, ry + (rowH - iconS) / 2, iconS, alpha); x += iconS + ig; }
                     using (Brush bt = new SolidBrush(main)) g.DrawString(temp, fTemp, bt, x, ry + (rowH - mTemp.Height) / 2, sf);
                     x += mTemp.Width + ig;
                     using (Brush bc = new SolidBrush(grey))
@@ -809,7 +810,7 @@ namespace TempOverlay
                             using (Brush bm = new SolidBrush(main)) g.DrawString(hm, fClock, bm, rx, y, sf);
                             if (secs)
                                 using (Brush bs = new SolidBrush(grey))
-                                    g.DrawString(ss, fSec, bs, rx + mHM.Width + gap, y + AscentPx(fClock, dpi) - AscentPx(fSec, dpi), sf);
+                                    g.DrawString(ss, fSec, bs, rx + pg.MeasureString(hm, fClock, 10000, sf).Width + gap, y + AscentPx(fClock, dpi) - AscentPx(fSec, dpi), sf);
                         }
                         if (showDate)
                             using (Brush bd = new SolidBrush(grey2))
@@ -976,7 +977,7 @@ namespace TempOverlay
         {
             if (!Cfg.ShowLabel) return "";
             if (Cfg.Label.Trim().Length > 0) return Cfg.Label.Trim();
-            return Cfg.Source == "city" ? Cfg.CityName : "";
+            return Cfg.Lat.HasValue ? Cfg.CityName : "";
         }
         string TempText()
         {
@@ -1005,7 +1006,8 @@ namespace TempOverlay
             bool fast = Cfg.IsPanel && Cfg.ShowClock;
             int want = fast ? 1000 : 3000;
             if (tmr.Interval != want) tmr.Interval = want;
-            Ov.WeatherCode = Cfg.Source == "city" ? code : -1;
+            Ov.WeatherCode = Cfg.Lat.HasValue ? code : -1;
+            Ov.ReserveIcon = Cfg.Lat.HasValue;   // reserva o espaco do icone para o painel nao mudar de tamanho quando ele chega
             Ov.Draw(Cfg, LabelText(), TempText()); Ov.KeepOnTop();
         }
 
@@ -1026,12 +1028,13 @@ namespace TempOverlay
                 }
                 catch { }
                 if (v != value) { value = v; Render(); }
-                return;
             }
+            // Site: temperatura (fonte "cidade") ou so o icone do clima (fonte TXT, se houver cidade escolhida)
             if (!Cfg.Lat.HasValue || fetching) return;
             if (!force && (DateTime.Now - lastFetch).TotalMinutes < Math.Max(1, Cfg.RefreshMin)) return;
             fetching = true; lastFetch = DateTime.Now;
             double lat = Cfg.Lat.Value, lon = Cfg.Lon.Value;
+            bool takeTemp = Cfg.Source != "txt";
             ThreadPool.QueueUserWorkItem(delegate
             {
                 double? v = null; int wc = -1;
@@ -1039,7 +1042,7 @@ namespace TempOverlay
                 Post(delegate
                 {
                     fetching = false;
-                    if (v.HasValue) { value = v; code = wc; } else if (force) lastFetch = DateTime.MinValue;
+                    if (v.HasValue) { if (takeTemp) value = v; code = wc; } else if (force) lastFetch = DateTime.MinValue;
                     Render(); Win.Trim();
                 });
             });
@@ -1160,7 +1163,7 @@ namespace TempOverlay
             Controls.Add(tabs);
 
             // --- fonte ---
-            rbCity = new RadioButton { Text = "Cidade (internet)", Left = 14, Top = 14, Width = 300, Checked = c.Source == "city" };
+            rbCity = new RadioButton { Text = "Temperatura do site (cidade)", Left = 14, Top = 14, Width = 380, Checked = c.Source == "city" };
             tbCity = new TextBox { Left = 14, Top = 44, Width = 270, Text = c.CityName };
             tbCity.KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Search(); } };
             btnSearch = Btn("Buscar", 292, 42, 90); btnSearch.Click += delegate { Search(); };
@@ -1172,7 +1175,7 @@ namespace TempOverlay
             lblSel = new Label { Left = 14, Top = 162, Width = 368, Height = 18, Text = SelText(), ForeColor = sel != null ? Color.FromArgb(0x16, 0x65, 0x34) : Ink2 };
             Label l1 = Lbl("Atualizar a cada (min)", 14, 192, 170);
             nudRef = Nud(190, 188, 1, 120, c.RefreshMin);
-            rbTxt = new RadioButton { Text = "Arquivo TXT (só um número, ex.: 27,5)", Left = 14, Top = 236, Width = 360, Checked = c.Source == "txt" };
+            rbTxt = new RadioButton { Text = "Temperatura do arquivo TXT (só um número, ex.: 27,5)", Left = 14, Top = 236, Width = 400, Checked = c.Source == "txt" };
             tbTxt = new TextBox { Left = 14, Top = 266, Width = 270, Text = c.TxtPath };
             btnBrowse = Btn("Procurar", 292, 264, 90);
             btnBrowse.Click += delegate
@@ -1180,7 +1183,7 @@ namespace TempOverlay
                 using (OpenFileDialog d = new OpenFileDialog { Filter = "Texto (*.txt)|*.txt|Todos|*.*", Title = "Arquivo com a temperatura" })
                     if (d.ShowDialog(this) == DialogResult.OK) { tbTxt.Text = d.FileName; rbTxt.Checked = true; }
             };
-            Label h1 = Lbl("O arquivo é relido a cada poucos segundos.", 14, 296, 368); h1.ForeColor = Ink2;
+            Label h1 = Lbl("O arquivo é relido a cada poucos segundos. Com o TXT, a cidade escolhida acima continua fornecendo o ícone do clima (e o nome).", 14, 296, 400); h1.ForeColor = Ink2; h1.Height = 52;
             rbCity.CheckedChanged += delegate { SourceState(); };
             t1.Controls.AddRange(new Control[] { rbCity, tbCity, btnSearch, lb, lblSel, l1, nudRef, rbTxt, tbTxt, btnBrowse, h1 });
 
@@ -1280,8 +1283,7 @@ namespace TempOverlay
 
         void SourceState()
         {
-            bool city = rbCity.Checked;
-            tbCity.Enabled = btnSearch.Enabled = lb.Enabled = nudRef.Enabled = city;
+            bool city = rbCity.Checked;   // a cidade fica sempre ativa: no modo TXT ela fornece o icone do clima
             tbTxt.Enabled = btnBrowse.Enabled = !city;
         }
         void PickColor(Button b)

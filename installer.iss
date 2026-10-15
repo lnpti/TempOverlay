@@ -1,6 +1,6 @@
 ; TempOverlay - Inno Setup. Compilar: ISCC.exe installer.iss (depois do build.ps1)
 #define AppName    "TempOverlay"
-#define AppVersion "1.2.4"
+#define AppVersion "1.2.5"
 #define AppPublisher "lnpti"
 #define AppURL     "https://github.com/lnpti/TempOverlay"
 #define AppExe     "TempOverlay.exe"
