@@ -20,14 +20,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyVersion("1.2.2.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.2.1";
+        public const string Version = "1.2.2";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -195,7 +195,7 @@ namespace TempOverlay
         }
         public static string Get(string url)
         {
-            using (WebResponse resp = Req(url, 15000).GetResponse())
+            using (WebResponse resp = Req(url, 25000).GetResponse())
             using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) return sr.ReadToEnd();
         }
         public static string Download(string url)
@@ -1110,14 +1110,18 @@ namespace TempOverlay
             lb.Items.Clear(); lb.Items.Add("Buscando...");
             ThreadPool.QueueUserWorkItem(delegate
             {
-                List<Place> res = null;
-                try { res = Net.SearchCity(q); } catch { }
+                List<Place> res = null; string err = "";
+                for (int i = 0; i < 3 && res == null; i++)
+                {
+                    try { res = Net.SearchCity(q); }
+                    catch (Exception ex) { err = ex.Message; Thread.Sleep(700); }
+                }
                 try
                 {
                     BeginInvoke((Action)delegate
                     {
                         results = res ?? new List<Place>(); lb.Items.Clear();
-                        if (res == null) lb.Items.Add("Erro na busca (sem internet?)");
+                        if (res == null) { lb.Items.Add("Erro na busca: " + err); lb.Items.Add("Verifique a internet e tente de novo."); }
                         else if (res.Count == 0) lb.Items.Add("Nada encontrado");
                         foreach (Place p in results) lb.Items.Add(p.Desc);
                     });
