@@ -11,6 +11,8 @@ using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -20,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.2.2.0")]
+[assembly: AssemblyVersion("1.2.3.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.2.2";
+        public const string Version = "1.2.3";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -182,6 +184,63 @@ namespace TempOverlay
 
     class Place { public string Name, Desc; public double Lat, Lon; }
 
+    // Lista embutida (RS) + coordenadas digitadas: funciona mesmo se a rede bloquear o site de busca.
+    static class Offline
+    {
+        const string Table =
+            "Porto Alegre|-30.0346|-51.2177;Erechim|-27.6346|-52.2754;Marau|-28.4498|-52.2007;Sarandi|-27.9437|-52.9227;" +
+            "Cacique Doble|-27.7667|-51.6588;Lagoa Vermelha|-28.2086|-51.5258;Passo Fundo|-28.2628|-52.4067;Caxias do Sul|-29.1678|-51.1794;" +
+            "Santa Maria|-29.6842|-53.8069;Pelotas|-31.7654|-52.3376;Canoas|-29.9178|-51.1839;Novo Hamburgo|-29.6783|-51.1306;" +
+            "São Leopoldo|-29.7604|-51.1472;Gravataí|-29.9444|-50.9919;Viamão|-30.0811|-51.0233;Santa Cruz do Sul|-29.7178|-52.4258;" +
+            "Uruguaiana|-29.7547|-57.0883;Bagé|-31.3314|-54.1069;Rio Grande|-32.035|-52.0986;Ijuí|-28.3878|-53.9147;" +
+            "Santo Ângelo|-28.2992|-54.2631;Cruz Alta|-28.6392|-53.6064;Carazinho|-28.2839|-52.7861;Vacaria|-28.5122|-50.9339;" +
+            "Bento Gonçalves|-29.1661|-51.5189;Farroupilha|-29.2253|-51.3475;Lajeado|-29.4669|-51.9614;Santa Rosa|-27.8708|-54.4814;" +
+            "Frederico Westphalen|-27.3592|-53.3942;Palmeira das Missões|-27.8989|-53.3139;Santiago|-29.1917|-54.8667;" +
+            "São Borja|-28.6578|-56.0044;Alegrete|-29.7831|-55.7919;Camaquã|-30.8511|-51.8117;Torres|-29.3353|-49.7269;" +
+            "Tramandaí|-30.0|-50.1333;Guaíba|-30.1139|-51.325;Cachoeira do Sul|-30.0397|-52.8939;Venâncio Aires|-29.6|-52.1917;" +
+            "Montenegro|-29.6889|-51.4608;Estrela|-29.5008|-51.9622;Soledade|-28.8169|-52.5128;Getúlio Vargas|-27.8903|-52.2275;" +
+            "Gaurama|-27.5864|-52.0872;Tapejara|-28.0689|-52.0089;Casca|-28.5614|-51.9778;Nova Prata|-28.78|-51.6144;" +
+            "Encantado|-29.2392|-51.8706;Espumoso|-28.7258|-52.8508;Ibirubá|-28.6278|-53.0889;Não-Me-Toque|-28.4558|-52.8197;" +
+            "Tapera|-28.6247|-52.8644;Sananduva|-27.9544|-51.8092;Ciríaco|-28.3414|-51.8719;David Canabarro|-28.3881|-51.8481;" +
+            "Ibiaçá|-28.0561|-51.8517;Paim Filho|-27.7033|-51.7608;Barracão|-27.67|-51.46;Santa Bárbara do Sul|-28.3664|-53.2461;" +
+            "Tupanciretã|-29.0817|-53.8381;São Gabriel|-30.3367|-54.32;Sapucaia do Sul|-29.8283|-51.145;Esteio|-29.8614|-51.1789;" +
+            "Cachoeirinha|-29.9472|-51.0939;Alvorada|-29.99|-51.0833;Sapiranga|-29.6358|-50.9261;Taquara|-29.65|-50.7778;" +
+            "Gramado|-29.3789|-50.8742;Canela|-29.3656|-50.8119;Osório|-29.8886|-50.2694;Capão da Canoa|-29.7458|-50.0114";
+
+        static string Norm(string t)
+        {
+            string d = t.Normalize(NormalizationForm.FormD); StringBuilder sb = new StringBuilder();
+            foreach (char ch in d) if (CharUnicodeInfo.GetUnicodeCategory(ch) != UnicodeCategory.NonSpacingMark) sb.Append(char.ToLowerInvariant(ch));
+            return sb.ToString().Trim();
+        }
+
+        public static List<Place> Search(string q)
+        {
+            List<Place> list = new List<Place>();
+            Match m = Regex.Match(q, "^\\s*(-?\\d+(?:[.,]\\d+)?)\\s*[;, ]\\s*(-?\\d+(?:[.,]\\d+)?)\\s*$");
+            if (m.Success)
+            {
+                Place c = new Place(); c.Name = "Local";
+                c.Lat = double.Parse(m.Groups[1].Value.Replace(',', '.'), CultureInfo.InvariantCulture);
+                c.Lon = double.Parse(m.Groups[2].Value.Replace(',', '.'), CultureInfo.InvariantCulture);
+                c.Desc = "Coordenadas " + c.Lat.ToString("0.####", CultureInfo.InvariantCulture) + ", " + c.Lon.ToString("0.####", CultureInfo.InvariantCulture);
+                list.Add(c); return list;
+            }
+            string n = Norm(q); if (n.Length == 0) return list;
+            foreach (string row in Table.Split(';'))
+            {
+                string[] f = row.Split('|');
+                if (Norm(f[0]).Contains(n))
+                {
+                    Place p = new Place(); p.Name = f[0]; p.Desc = f[0] + ", Rio Grande do Sul, Brasil";
+                    p.Lat = double.Parse(f[1], CultureInfo.InvariantCulture); p.Lon = double.Parse(f[2], CultureInfo.InvariantCulture);
+                    list.Add(p);
+                }
+            }
+            return list;
+        }
+    }
+
     // ---------- rede ----------
     static class Net
     {
@@ -193,23 +252,134 @@ namespace TempOverlay
             r.UserAgent = Const.App + "/" + Const.Version; r.Timeout = timeout; r.ReadWriteTimeout = timeout;
             return r;
         }
+        static void Log(string msg)
+        {
+            try
+            {
+                Directory.CreateDirectory(Config.Dir);
+                string f = Path.Combine(Config.Dir, "rede.log");
+                if (File.Exists(f) && new FileInfo(f).Length > 40000) File.Delete(f);
+                File.AppendAllText(f, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + msg + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        // GET normal (respeita proxy do Windows); se falhar/demorar, cai para conexao forcada por IPv4
+        // (redes com IPv6 quebrado deixam o .NET pendurado em hosts que tem IPv4 e IPv6).
         public static string Get(string url)
         {
-            using (WebResponse resp = Req(url, 25000).GetResponse())
-            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) return sr.ReadToEnd();
+            Stopwatch sw = Stopwatch.StartNew();
+            try
+            {
+                using (WebResponse resp = Req(url, 9000).GetResponse())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) return sr.ReadToEnd();
+            }
+            catch (Exception ex)
+            {
+                Log("GET http falhou (" + sw.ElapsedMilliseconds + " ms) " + new Uri(url).Host + ": " + ex.Message + " -> tentando IPv4");
+            }
+            byte[] data = RawGet(url, 5);
+            Log("GET via IPv4 ok " + new Uri(url).Host + " (" + sw.ElapsedMilliseconds + " ms)");
+            return Encoding.UTF8.GetString(data);
         }
+
         public static string Download(string url)
         {
             string dir = Path.Combine(Path.GetTempPath(), "tempoverlay_upd_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(dir);
             string dest = Path.Combine(dir, "TempOverlay_Setup.exe");
-            using (WebResponse resp = Req(url, 60000).GetResponse())
-            using (Stream rs = resp.GetResponseStream())
-            using (FileStream fs = File.Create(dest)) rs.CopyTo(fs);
+            try
+            {
+                using (WebResponse resp = Req(url, 20000).GetResponse())
+                using (Stream rs = resp.GetResponseStream())
+                using (FileStream fs = File.Create(dest)) rs.CopyTo(fs);
+            }
+            catch (Exception ex)
+            {
+                Log("download http falhou " + new Uri(url).Host + ": " + ex.Message + " -> tentando IPv4");
+                File.WriteAllBytes(dest, RawGet(url, 5));
+            }
             FileInfo fi = new FileInfo(dest);
             using (FileStream fs = File.OpenRead(dest))
                 if (fi.Length < 100000 || fs.ReadByte() != 'M' || fs.ReadByte() != 'Z') throw new Exception("download invalido");
             return dest;
+        }
+
+        static int IndexOf(byte[] d, byte[] pat, int from)
+        {
+            for (int i = from; i <= d.Length - pat.Length; i++)
+            {
+                int j = 0; while (j < pat.Length && d[i + j] == pat[j]) j++;
+                if (j == pat.Length) return i;
+            }
+            return -1;
+        }
+
+        // HTTP/1.1 minimo sobre IPv4 + TLS 1.2 (segue redirecionamentos, decodifica chunked)
+        static byte[] RawGet(string url, int redirects)
+        {
+            Uri u = new Uri(url);
+            List<IPAddress> v4 = new List<IPAddress>();
+            foreach (IPAddress ip in Dns.GetHostAddresses(u.Host)) if (ip.AddressFamily == AddressFamily.InterNetwork) v4.Add(ip);
+            if (v4.Count == 0) throw new Exception("sem endereco IPv4 para " + u.Host);
+            TcpClient cli = null; Exception last = null;
+            foreach (IPAddress ip in v4)
+            {
+                try
+                {
+                    TcpClient c = new TcpClient(AddressFamily.InterNetwork);
+                    IAsyncResult ar = c.BeginConnect(ip, u.Port, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(8000)) { c.Close(); throw new TimeoutException("tempo esgotado conectando a " + u.Host); }
+                    c.EndConnect(ar); cli = c; break;
+                }
+                catch (Exception ex) { last = ex; }
+            }
+            if (cli == null) throw last ?? new Exception("sem conexao");
+            byte[] data;
+            using (cli)
+            {
+                cli.ReceiveTimeout = 30000; cli.SendTimeout = 30000;
+                Stream st = cli.GetStream();
+                if (u.Scheme == "https")
+                {
+                    SslStream ss = new SslStream(st);
+                    ss.AuthenticateAsClient(u.Host, null, System.Security.Authentication.SslProtocols.Tls12, false);
+                    st = ss;
+                }
+                byte[] req = Encoding.ASCII.GetBytes("GET " + u.PathAndQuery + " HTTP/1.1\r\nHost: " + u.Host + "\r\nUser-Agent: " +
+                    Const.App + "/" + Const.Version + "\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+                st.Write(req, 0, req.Length);
+                using (MemoryStream all = new MemoryStream()) { st.CopyTo(all); data = all.ToArray(); }
+            }
+            int he = IndexOf(data, new byte[] { 13, 10, 13, 10 }, 0);
+            if (he < 0) throw new Exception("resposta invalida");
+            string head = Encoding.ASCII.GetString(data, 0, he);
+            int status = int.Parse(head.Substring(9, 3));
+            if (status >= 300 && status < 400 && redirects > 0)
+            {
+                Match loc = Regex.Match(head, "(?im)^location:\\s*(\\S+)");
+                if (loc.Success) return RawGet(new Uri(u, loc.Groups[1].Value).ToString(), redirects - 1);
+            }
+            if (status >= 400) throw new Exception("HTTP " + status);
+            int pos = he + 4;
+            if (Regex.IsMatch(head, "(?im)^transfer-encoding:\\s*chunked"))
+            {
+                MemoryStream body = new MemoryStream();
+                while (pos < data.Length)
+                {
+                    int le = IndexOf(data, new byte[] { 13, 10 }, pos);
+                    if (le < 0) break;
+                    string hex = Encoding.ASCII.GetString(data, pos, le - pos).Split(';')[0].Trim();
+                    int len = Convert.ToInt32(hex, 16);
+                    if (len == 0) break;
+                    body.Write(data, le + 2, Math.Min(len, data.Length - le - 2));
+                    pos = le + 2 + len + 2;
+                }
+                return body.ToArray();
+            }
+            byte[] outb = new byte[data.Length - pos];
+            Buffer.BlockCopy(data, pos, outb, 0, outb.Length);
+            return outb;
         }
 
         public static List<Place> SearchCity(string name)
@@ -1110,18 +1280,29 @@ namespace TempOverlay
             lb.Items.Clear(); lb.Items.Add("Buscando...");
             ThreadPool.QueueUserWorkItem(delegate
             {
-                List<Place> res = null; string err = "";
-                for (int i = 0; i < 3 && res == null; i++)
+                List<Place> res = null, off = null; string err = "";
+                List<Place> coords = Offline.Search(q);
+                bool isCoord = coords.Count == 1 && coords[0].Name == "Local";
+                if (isCoord) res = coords;
+                for (int i = 0; i < 2 && res == null; i++)
                 {
                     try { res = Net.SearchCity(q); }
                     catch (Exception ex) { err = ex.Message; Thread.Sleep(700); }
                 }
+                if (res == null) off = Offline.Search(q);
                 try
                 {
                     BeginInvoke((Action)delegate
                     {
+                        if (off != null && off.Count > 0)
+                        {
+                            results = off; lb.Items.Clear();
+                            foreach (Place p in off) lb.Items.Add(p.Desc);
+                            lblSel.ForeColor = Ink2; lblSel.Text = "Sem acesso ao site de busca: mostrando a lista embutida.";
+                            return;
+                        }
                         results = res ?? new List<Place>(); lb.Items.Clear();
-                        if (res == null) { lb.Items.Add("Erro na busca: " + err); lb.Items.Add("Verifique a internet e tente de novo."); }
+                        if (res == null) { lb.Items.Add("Sem acesso ao site de busca (" + err + ")."); lb.Items.Add("Digite as coordenadas, ex.: -27.63, -52.27"); }
                         else if (res.Count == 0) lb.Items.Add("Nada encontrado");
                         foreach (Place p in results) lb.Items.Add(p.Desc);
                     });
