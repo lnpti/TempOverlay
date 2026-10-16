@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.6.3.0")]
+[assembly: AssemblyVersion("1.6.4.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.6.3";
+        public const string Version = "1.6.4";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -770,6 +770,8 @@ namespace TempOverlay
         Bitmap logo;
         public int WeatherCode = -1;
         public bool ReserveIcon;
+        public float[] Hist;            // historico do nivel do canal (waveform continuo)
+        public float RtaTop = -45f;     // maior nivel recente do RTA (dB): a escala dos graficos acompanha o sinal
         public float[] RtaCap;       // picos (hold) do RTA, para as tampinhas flutuantes do grafico
         public string GraphName = "";
         public float[] Rta;          // espectro da X32 (dB por faixa) para o estilo com RTA
@@ -1261,7 +1263,7 @@ namespace TempOverlay
                         int a = i * bins / N, b = Math.Max(a + 1, (i + 1) * bins / N);
                         for (int j = a; j < b && j < bins; j++) db = Math.Max(db, v[j]);
                     }
-                    float amp = Math.Max(0f, Math.Min(1f, (db + 70f) / 60f * gain));
+                    float amp = RtaAmp(db, gain);
                     float bh = Math.Max(barW, amp * maxH), bx = x0 + i * (barW + gapB);
                     using (GraphicsPath bar = Round(Rectangle.Round(new RectangleF(bx, baseY - bh, barW, bh)), (int)Math.Max(2f, barW)))
                         g.FillPath(body, bar);
@@ -1300,13 +1302,105 @@ namespace TempOverlay
                         int a = i * bins / N, b = Math.Max(a + 1, (i + 1) * bins / N);
                         for (int j = a; j < b && j < bins; j++) db = Math.Max(db, v[j]);
                     }
-                    float amp = Math.Max(0f, Math.Min(1f, (db + 70f) / 60f * gain));     // -70 .. -10 dB
+                    float amp = RtaAmp(db, gain);     // -70 .. -10 dB
                     float hh = Math.Max(barW / 2f, amp * maxH), bx = x0 + i * (barW + gapB) + barW / 2;
                     g.DrawLine(bar, bx, mid - hh, bx, mid + hh);
                 }
             }
             using (Brush bt = new SolidBrush(Color.FromArgb(alpha, 138, 138, 138)))
                 g.DrawString(GraphName, fLabel, bt, gx + 8 * k, gy + 4 * k, sf);
+        }
+
+        // waveform continuo: barras espelhadas arredondadas que rolam (o mais novo na direita), nivel do canal escolhido, sem fundo (o mais novo na direita), nivel do canal escolhido, sem fundo
+        void DrawWaveScroll(Graphics g, Config c, float gx, float gy, float gw, float gh, Font fLabel, StringFormat sf, float k, int alpha)
+        {
+            float top = gy + 26 * k, bottom = gy + gh - 8 * k;   // o topo fica reservado para o rotulo: as barras nunca passam dele
+            float mid = (top + bottom) / 2, maxH = (bottom - top) / 2;
+            float barW = Math.Max(2f, 4 * k), gapB = Math.Max(2f, 3 * k);
+            int N = Math.Max(8, (int)((gw - 16 * k) / (barW + gapB)));
+            float usedW = N * (barW + gapB) - gapB, x0 = gx + (gw - usedW) / 2;
+            float[] hs = Hist; float gain = Math.Max(0.1f, c.GraphGain / 100f);
+            Color ca = Parse(c.GraphColorA, Color.FromArgb(34, 211, 238)), cz = Parse(c.GraphColorB, Color.FromArgb(167, 139, 250));
+            using (LinearGradientBrush lg = new LinearGradientBrush(new PointF(x0, 0), new PointF(x0 + usedW, 0), Color.FromArgb(alpha, ca), Color.FromArgb(alpha, cz)))
+            using (Pen bar = new Pen(lg, barW))
+            {
+                bar.StartCap = LineCap.Round; bar.EndCap = LineCap.Round;
+                for (int i = 0; i < N; i++)
+                {
+                    int idx = hs == null ? -1 : hs.Length - N + i;
+                    float v = (hs != null && idx >= 0 && idx < hs.Length) ? hs[idx] : 0f;
+                    float amp = (float)Math.Pow(Math.Max(0f, Math.Min(1f, v * gain)), 0.6);
+                    float hh = Math.Max(barW / 2f, amp * maxH), bx = x0 + i * (barW + gapB) + barW / 2;
+                    g.DrawLine(bar, bx, mid - hh, bx, mid + hh);
+                }
+            }
+            using (Brush bt = new SolidBrush(Color.FromArgb(alpha, 138, 138, 138)))
+                g.DrawString(GraphName, fLabel, bt, gx + 8 * k, gy + 4 * k, sf);
+        }
+
+        // espectro (area verde) com grade e escala de +15 a -15 dB, no estilo da tela de EQ/RTA da X32 (sem a curva e as bolinhas do EQ)
+        void DrawSpectrumEq(Graphics g, Config c, float gx, float gy, float gw, float gh, Font fLabel, StringFormat sf, float k, int alpha)
+        {
+            float left = 28 * k, right = 8 * k, top = 8 * k, bottom = 18 * k;
+            float px = gx + left, py = gy + top, pw = gw - left - right, ph = gh - top - bottom;
+            Func<double, float> xOf = delegate(double f) { return px + (float)(Math.Log10(Math.Max(20, Math.Min(20000, f)) / 20.0) / 3.0) * pw; };
+            Func<double, float> yOf = delegate(double db) { return py + (float)((15 - Math.Max(-15, Math.Min(15, db))) / 30.0) * ph; };
+            using (GraphicsPath gp = Round(new Rectangle((int)gx, (int)gy, (int)gw, (int)gh), (int)(12 * k)))
+            {
+                using (Brush bg = new SolidBrush(Color.FromArgb(alpha, 22, 22, 24))) g.FillPath(bg, gp);
+                using (Pen bd = new Pen(Color.FromArgb(alpha, 52, 52, 58), 1)) g.DrawPath(bd, gp);
+            }
+            using (Pen grid = new Pen(Color.FromArgb(alpha * 60 / 255, 190, 190, 200), 1))
+            using (Brush lb = new SolidBrush(Color.FromArgb(alpha, 170, 170, 175)))
+            {
+                for (int db = 15; db >= -15; db -= 5)
+                {
+                    float y = yOf(db);
+                    g.DrawLine(grid, px, y, px + pw, y);
+                    string t = db.ToString(CultureInfo.InvariantCulture);
+                    SizeF m = g.MeasureString(t, fLabel, 1000, sf);
+                    g.DrawString(t, fLabel, lb, px - 4 * k - m.Width, y - m.Height / 2, sf);
+                }
+                bool wide = pw > 240 * k;
+                float[] fr = wide ? new float[] { 20, 40, 60, 100, 200, 400, 600, 1000, 2000, 4000, 6000, 10000, 20000 } : new float[] { 20, 100, 1000, 10000, 20000 };
+                foreach (float f in fr)
+                {
+                    float x = xOf(f);
+                    g.DrawLine(grid, x, py, x, py + ph);
+                    if (wide && !(f == 20 || f == 40 || f == 60 || f == 100 || f == 200 || f == 400 || f == 1000 || f == 2000 || f == 4000 || f == 10000 || f == 20000)) continue;
+                    string t = f >= 1000 ? (f / 1000).ToString(CultureInfo.InvariantCulture) + "k" : f.ToString(CultureInfo.InvariantCulture);
+                    SizeF m = g.MeasureString(t, fLabel, 1000, sf);
+                    g.DrawString(t, fLabel, lb, Math.Max(gx + 2 * k, Math.Min(gx + gw - m.Width - 2 * k, x - m.Width / 2)), py + ph + 3 * k, sf);
+                }
+            }
+            // espectro: sobe do fundo (-15 dB) ate cerca de -3 dB no nivel mais alto recente
+            float[] v = Rta;
+            if (v != null && v.Length > 1)
+            {
+                Color fillC = Parse(c.GraphColorA, Color.FromArgb(38, 140, 50));
+                int n = v.Length; float gain = Math.Max(0.1f, c.GraphGain / 100f);
+                float[] sv = new float[n];
+                for (int i = 0; i < n; i++)
+                {
+                    float acc = 0, wsum = 0;
+                    for (int d = -2; d <= 2; d++) { int j = Math.Max(0, Math.Min(n - 1, i + d)); float wgt = 3 - Math.Abs(d); acc += v[j] * wgt; wsum += wgt; }
+                    sv[i] = acc / wsum;
+                }
+                PointF[] pts = new PointF[n];
+                for (int i = 0; i < n; i++) pts[i] = new PointF(px + i / (float)(n - 1) * pw, yOf(-15 + RtaAmp(sv[i], gain) * 12));
+                g.SetClip(new RectangleF(px, py, pw, ph));
+                using (GraphicsPath area = new GraphicsPath())
+                {
+                    area.AddLine(px, py + ph, pts[0].X, pts[0].Y); area.AddCurve(pts, 0.5f); area.AddLine(pts[n - 1].X, pts[n - 1].Y, px + pw, py + ph); area.CloseFigure();
+                    using (LinearGradientBrush fb = new LinearGradientBrush(new PointF(0, py), new PointF(0, py + ph), Color.FromArgb(alpha * 235 / 255, fillC), Color.FromArgb(alpha * 150 / 255, fillC)))
+                        g.FillPath(fb, area);
+                }
+                g.ResetClip();
+            }
+            string nm = GraphName;   // so o rotulo do canal (sem o texto "RTA:")
+            SizeF mn = g.MeasureString(nm, fLabel, 1000, sf);
+            using (Brush bt = new SolidBrush(Color.FromArgb(alpha, 215, 215, 220)))
+                g.DrawString(nm, fLabel, bt, px + pw - mn.Width - 6 * k, py + 4 * k, sf);
         }
 
         // espectro (area) com escala, no estilo da tela de RTA da X32: grade, frequencias (20 Hz - 20 kHz, log) e dB na lateral.
@@ -1320,7 +1414,8 @@ namespace TempOverlay
                 using (Brush bg = new SolidBrush(Color.FromArgb(alpha, 22, 22, 24))) g.FillPath(bg, gp);
                 using (Pen bd = new Pen(Color.FromArgb(alpha, 52, 52, 58), 1)) g.DrawPath(bd, gp);
             }
-            float range = 80f / Math.Max(0.1f, c.GraphGain / 100f);          // dB visiveis: 0 ... -range
+            float range = 60f / Math.Max(0.1f, c.GraphGain / 100f);          // dB visiveis abaixo do topo
+            float topDb = Math.Min(0f, (float)Math.Ceiling(RtaTop / 10.0) * 10f);   // o topo acompanha o nivel real do sinal
             float stepDb = range > 60 ? 20 : (range > 30 ? 10 : 5);
             using (Pen grid = new Pen(Color.FromArgb(alpha * 60 / 255, 190, 190, 200), 1))
             using (Brush lb = new SolidBrush(Color.FromArgb(alpha, 170, 170, 175)))
@@ -1329,7 +1424,7 @@ namespace TempOverlay
                 {
                     float y = py + (-db / range) * ph;
                     g.DrawLine(grid, px, y, px + pw, y);
-                    string t = ((int)db).ToString(CultureInfo.InvariantCulture);
+                    string t = ((int)(topDb + db)).ToString(CultureInfo.InvariantCulture);
                     SizeF m = g.MeasureString(t, fLabel, 1000, sf);
                     g.DrawString(t, fLabel, lb, px - 4 * k - m.Width, y - m.Height / 2, sf);
                 }
@@ -1352,26 +1447,48 @@ namespace TempOverlay
             {
                 Color fillC = Parse(c.GraphColorA, Color.FromArgb(34, 150, 64)), lineC = Parse(c.GraphColorB, Color.FromArgb(110, 220, 120));
                 int n = v.Length;
-                PointF[] pts = new PointF[n + 2];
-                pts[0] = new PointF(px, py + ph);
+                // suavizacao: media ponderada entre faixas vizinhas (janela de 5, pesos 1-2-3-2-1) + curva spline, sem pontas agudas
+                float[] sv = new float[n];
+                for (int i = 0; i < n; i++)
+                {
+                    float acc = 0, wsum = 0;
+                    for (int d = -2; d <= 2; d++)
+                    {
+                        int j = Math.Max(0, Math.Min(n - 1, i + d)); float wgt = 3 - Math.Abs(d);
+                        acc += v[j] * wgt; wsum += wgt;
+                    }
+                    sv[i] = acc / wsum;
+                }
                 PointF[] top2 = new PointF[n];
                 for (int i = 0; i < n; i++)
                 {
-                    float db = Math.Max(-range, Math.Min(0f, v[i]));
+                    float db = Math.Max(-range, Math.Min(0f, sv[i] - topDb));
                     top2[i] = new PointF(px + i / (float)(n - 1) * pw, py + (-db / range) * ph);
-                    pts[i + 1] = top2[i];
                 }
-                pts[n + 1] = new PointF(px + pw, py + ph);
                 g.SetClip(new RectangleF(px, py, pw, ph));
-                using (LinearGradientBrush fb = new LinearGradientBrush(new PointF(0, py), new PointF(0, py + ph), Color.FromArgb(alpha * 230 / 255, fillC), Color.FromArgb(alpha * 110 / 255, fillC)))
-                    g.FillPolygon(fb, pts);
-                using (Pen lp = new Pen(Color.FromArgb(alpha, lineC), Math.Max(1.2f, 1.6f * k))) { lp.LineJoin = LineJoin.Round; g.DrawLines(lp, top2); }
+                using (GraphicsPath area = new GraphicsPath())
+                {
+                    area.AddLine(px, py + ph, top2[0].X, top2[0].Y);
+                    area.AddCurve(top2, 0.5f);
+                    area.AddLine(top2[n - 1].X, top2[n - 1].Y, px + pw, py + ph);
+                    area.CloseFigure();
+                    using (LinearGradientBrush fb = new LinearGradientBrush(new PointF(0, py), new PointF(0, py + ph), Color.FromArgb(alpha * 230 / 255, fillC), Color.FromArgb(alpha * 110 / 255, fillC)))
+                        g.FillPath(fb, area);
+                }
+                using (Pen lp = new Pen(Color.FromArgb(alpha, lineC), Math.Max(1.2f, 1.6f * k))) { lp.LineJoin = LineJoin.Round; g.DrawCurve(lp, top2, 0.5f); }
                 g.ResetClip();
             }
-            string nm = "RTA: " + GraphName;
+            string nm = GraphName;   // so o rotulo do canal (sem o texto "RTA:")
             SizeF mn = g.MeasureString(nm, fLabel, 1000, sf);
             using (Brush bt = new SolidBrush(Color.FromArgb(alpha, 215, 215, 220)))
                 g.DrawString(nm, fLabel, bt, px + pw - mn.Width - 6 * k, py + 4 * k, sf);
+        }
+
+        // altura (0..1) de uma faixa: 45 dB abaixo do maior nivel recente; "Sensib." multiplica. Funciona em qualquer faixa de nivel que a mesa envie.
+        float RtaAmp(float db, float gain)
+        {
+            const float span = 45f;
+            return Math.Max(0f, Math.Min(1f, (db - (RtaTop - span)) / span * gain));
         }
 
         // grafico de barras estilo RTA (so para cima): barras fixas que sobem e descem, gradiente indigo -> roxo -> magenta -> laranja,
@@ -1379,7 +1496,9 @@ namespace TempOverlay
         void DrawWave(Graphics g, Config c, float gx, float gy, float gw, float gh, Font fLabel, StringFormat sf, float k, int alpha)
         {
             if (c.GraphStyle == "pill") { DrawPill(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
+            if (c.GraphStyle == "scroll") { DrawWaveScroll(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
             if (c.GraphStyle == "wave") { DrawWaveform(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
+            if (c.GraphStyle == "speq") { DrawSpectrumEq(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
             if (c.GraphStyle == "spectrum") { DrawSpectrum(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
             float padH = 6 * k, baseY = gy + gh - 18 * k, topY = gy + 26 * k, maxH = baseY - topY;
             float barW = Math.Max(4f, 11 * k), gapB = Math.Max(2f, 5 * k);
@@ -1412,8 +1531,8 @@ namespace TempOverlay
                             if (cp != null && j < cp.Length) cdb = Math.Max(cdb, cp[j]);
                         }
                     }
-                    float amp = Math.Max(0f, Math.Min(1f, (db + 70f) / 60f * gain));      // -70 .. -10 dB
-                    float camp = Math.Max(amp, Math.Max(0f, Math.Min(1f, (cdb + 70f) / 60f * gain)));
+                    float amp = RtaAmp(db, gain);      // -70 .. -10 dB
+                    float camp = Math.Max(amp, RtaAmp(cdb, gain));
                     float bh = Math.Max(3 * k, amp * maxH), bx = x0 + i * (barW + gapB);
                     g.FillRectangle(lg, bx, baseY - bh, barW, bh);
                     float capTop = baseY - Math.Max(bh, camp * maxH) - 7 * k - capH;
@@ -1698,6 +1817,9 @@ namespace TempOverlay
         long airSinceTicks;
         float[] rta; DateTime rtaSeen = DateTime.MinValue;
         float[] rtaCap;
+        float[] hist = new float[160];
+        float rtaTop = -45f;
+        bool rtaLogged;
         string lastTip = "";
         readonly AutoResetEvent airWake = new AutoResetEvent(false);
         DateTime t0 = DateTime.Now, nextRetry = DateTime.MinValue, lastFetch = DateTime.MinValue;
@@ -1727,6 +1849,7 @@ namespace TempOverlay
             tmr.Interval = 3000; tmr.Tick += delegate { Tick(); }; tmr.Start();
             Thread airThread = new Thread(AirLoop); airThread.IsBackground = true; airThread.Name = "x32"; airThread.Start();
             Thread rtaThread = new Thread(RtaLoop); rtaThread.IsBackground = true; rtaThread.Name = "x32-rta"; rtaThread.Start();
+            Thread graphThread = new Thread(GraphLoop); graphThread.IsBackground = true; graphThread.Name = "x32-nivel"; graphThread.Start();
             Render(); Refresh(true);
             if (firstRun || (Cfg.Source == "city" && !Cfg.Lat.HasValue)) OpenSettings();
             Win.Trim();
@@ -1765,7 +1888,7 @@ namespace TempOverlay
             while (!exiting)
             {
                 string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
-                if (!((Cfg.HasRta || Cfg.HasGraph) && IPAddress.TryParse(ip, out a)))
+                if (!((Cfg.HasRta || (Cfg.HasGraph && Cfg.GraphStyle != "scroll")) && IPAddress.TryParse(ip, out a)))
                 {
                     if (u != null) { u.Close(); u = null; }
                     if (rta != null) { rta = null; Post(delegate { Render(); }); }
@@ -1776,9 +1899,9 @@ namespace TempOverlay
                     if (u == null || ip != curIp)
                     {
                         if (u != null) u.Close();
-                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue; curSrc = null;
+                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue; curSrc = null; rtaLogged = false;
                     }
-                    string wantSrc = Cfg.HasGraph ? (Cfg.GraphCh ?? "") : "";
+                    string wantSrc = (Cfg.HasGraph && Cfg.GraphStyle != "scroll") ? (Cfg.GraphCh ?? "") : "";
                     if (wantSrc != curSrc)   // Painel 3: aponta o RTA da mesa para o canal escolhido nas configuracoes
                     {
                         curSrc = wantSrc; string nm; int si = X32.MeterIndex(wantSrc, out nm);
@@ -1800,6 +1923,14 @@ namespace TempOverlay
                         if (cc == null || cc.Length != nxt.Length) { cc = new float[nxt.Length]; for (int i = 0; i < cc.Length; i++) cc[i] = -90; }
                         float[] nc = new float[nxt.Length];
                         for (int i = 0; i < nc.Length; i++) nc[i] = Math.Max(nxt[i], cc[i] - capFall);   // pico segura e cai devagar
+                        float frameMax = -128f, frameMin = 128f;
+                        foreach (float x in db) { frameMax = Math.Max(frameMax, x); frameMin = Math.Min(frameMin, x); }
+                        rtaTop = frameMax > rtaTop ? frameMax : rtaTop - (float)(2.5 * dt);   // sobe na hora, cai devagar (2,5 dB/s)
+                        if (!rtaLogged)   // diagnostico: o que a mesa realmente envia (ajuda a calibrar a escala)
+                        {
+                            rtaLogged = true;
+                            try { File.AppendAllText(Path.Combine(Config.Dir, "rede.log"), DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " RTA recebido: " + db.Length + " faixas, " + d.Length + " bytes, minimo " + frameMin.ToString("0.0", CultureInfo.InvariantCulture) + " dB, maximo " + frameMax.ToString("0.0", CultureInfo.InvariantCulture) + " dB" + Environment.NewLine); } catch { }
+                        }
                         rtaCap = nc; rta = nxt; rtaSeen = DateTime.UtcNow;
                         if ((DateTime.UtcNow - lastPost).TotalMilliseconds > 55) { lastPost = DateTime.UtcNow; Post(delegate { Render(); }); }
                     }
@@ -1808,6 +1939,48 @@ namespace TempOverlay
                 {
                     if (rta != null && (DateTime.UtcNow - rtaSeen).TotalSeconds > 3) { rta = null; Post(delegate { Render(); }); }
                 }
+                catch (Exception) { Thread.Sleep(500); }
+            }
+            if (u != null) u.Close();
+        }
+        // waveform: nivel do canal escolhido (/meters/1), ~7 amostras por segundo, guardado num historico que o grafico desenha
+        void GraphLoop()
+        {
+            UdpClient u = null; IPEndPoint ep = null; string curIp = "", curPath = "";
+            DateTime lastSub = DateTime.MinValue;
+            while (!exiting)
+            {
+                string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
+                if (!(Cfg.HasGraph && Cfg.GraphStyle == "scroll" && IPAddress.TryParse(ip, out a)))
+                {
+                    if (u != null) { u.Close(); u = null; }
+                    Thread.Sleep(1000); continue;
+                }
+                try
+                {
+                    if (u == null || ip != curIp)
+                    {
+                        if (u != null) u.Close();
+                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue;
+                    }
+                    GraphSrc gsrc = X32.ParseGraphSource(Cfg.GraphCh);
+                    string wantPath = gsrc == null ? "/meters/1" : gsrc.MeterPath;
+                    if (wantPath != curPath) { curPath = wantPath; lastSub = DateTime.MinValue; }   // trocou de canal/aux para bus (ou o contrario)
+                    if ((DateTime.UtcNow - lastSub).TotalSeconds > 8) { byte[] sub = X32.MeterSubscribePacket(curPath, 3); u.Send(sub, sub.Length, ep); lastSub = DateTime.UtcNow; }
+                    u.Client.ReceiveTimeout = 500;
+                    IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] d = u.Receive(ref from); float[] v;
+                    int idx = gsrc == null ? -1 : gsrc.MeterIdx;
+                    if (idx >= 0 && X32.ParseMeterFloats(d, d.Length, curPath, out v) && idx < v.Length)
+                    {
+                        float[] nh = new float[hist.Length];
+                        Array.Copy(hist, 1, nh, 0, hist.Length - 1);
+                        nh[nh.Length - 1] = Math.Max(0f, v[idx]);
+                        hist = nh;
+                        Post(delegate { Render(); });
+                    }
+                }
+                catch (SocketException) { }
                 catch (Exception) { Thread.Sleep(500); }
             }
             if (u != null) u.Close();
@@ -1854,6 +2027,8 @@ namespace TempOverlay
             Ov.AirState = airState;
             Ov.Rta = rta;
             Ov.RtaCap = rtaCap;
+            Ov.Hist = hist;
+            Ov.RtaTop = Math.Max(rtaTop, -75f);   // nao amplifica silencio/ruido alem de -75 dB
             { string gn; X32.MeterIndex(Cfg.GraphCh, out gn); Ov.GraphName = Cfg.GraphLabel.Trim().Length > 0 ? Cfg.GraphLabel.Trim() : gn; }
             Ov.AirSince = airSinceTicks > 0 ? new DateTime(airSinceTicks) : DateTime.MinValue;
             string tip = (Cfg.HasAir && Cfg.AirIp.Trim().Length > 0 && airState < 0) ? "TempOverlay - X32 sem resposta" : Const.App;
@@ -2113,8 +2288,8 @@ namespace TempOverlay
             tbGraphLabel = new TextBox { Left = 108, Top = 254, Width = 170, Text = c.GraphLabel };
             nudGain = new NumericUpDown { Left = 292, Top = 254, Width = 80, Minimum = 10, Maximum = 400, Value = Math.Max(10, Math.Min(400, c.GraphGain)) };
             cbGraphStyle = new ComboBox { Left = 14, Top = 312, Width = 210, DropDownStyle = ComboBoxStyle.DropDownList };
-            cbGraphStyle.Items.AddRange(new object[] { "Barras coloridas com picos", "Barras azuis arredondadas", "Waveform (barras espelhadas)", "Espectro (área com escala)" });
-            cbGraphStyle.SelectedIndex = c.GraphStyle == "spectrum" ? 3 : (c.GraphStyle == "wave" ? 2 : (c.GraphStyle == "pill" ? 1 : 0));
+            cbGraphStyle.Items.AddRange(new object[] { "Barras coloridas com picos", "Barras azuis arredondadas", "Waveform (barras espelhadas)", "Espectro (área com escala)", "Waveform contínuo (rola, nível do canal)", "Espectro estilo X32 (escala +15/-15 dB)" });
+            cbGraphStyle.SelectedIndex = c.GraphStyle == "speq" ? 5 : c.GraphStyle == "scroll" ? 4 : (c.GraphStyle == "spectrum" ? 3 : (c.GraphStyle == "wave" ? 2 : (c.GraphStyle == "pill" ? 1 : 0)));
             chkReflect = new CheckBox { Text = "Reflexo", Left = 240, Top = 314, Width = 120, Checked = c.GraphReflect };
             graphColA = c.GraphColorA ?? ""; graphColB = c.GraphColorB ?? "";
             btnColA = Btn("", 14, 372, 64); btnColB = Btn("", 86, 372, 64);
@@ -2132,7 +2307,7 @@ namespace TempOverlay
             {
                 string ip = tbAirIp.Text.Trim(), ch = tbAirCh.Text, gch = tbGraphCh.Text;
                 string styleKey = StyleKeys[Math.Max(0, cbStyle.SelectedIndex)];
-                bool wantRta = styleKey == "panel2_air_rta", wantGraph = styleKey == "panel3_air_graph", wantWave = cbGraphStyle.SelectedIndex == 2;
+                bool wantRta = styleKey == "panel2_air_rta", wantGraph = styleKey == "panel3_air_graph", wantWave = cbGraphStyle.SelectedIndex == 4;
                 lblAirTest.ForeColor = Ink2; lblAirTest.Text = "Consultando a mesa...";
                 ThreadPool.QueueUserWorkItem(delegate
                 {
@@ -2141,7 +2316,7 @@ namespace TempOverlay
                     {
                         r = X32.Describe(ip, ch);
                         if (wantRta) r += "\n" + X32.RtaProbe(ip);
-                        if (wantGraph) r += "\n" + X32.GraphProbe(ip, gch);
+                        if (wantGraph) r += "\n" + (wantWave ? X32.MeterProbe(ip, gch) : X32.GraphProbe(ip, gch));
                     }
                     catch (Exception ex) { r = "Erro: " + ex.Message; }
                     try { BeginInvoke((Action)delegate { lblAirTest.ForeColor = r.StartsWith("Conectado") ? Color.FromArgb(0x16, 0x65, 0x34) : Ink; lblAirTest.Text = r; }); } catch { }
@@ -2212,9 +2387,9 @@ namespace TempOverlay
         }
         void RefreshGraphSwatches()
         {
-            int gs = cbGraphStyle.SelectedIndex;   // 0 colorido, 1 azul arredondado, 2 waveform, 3 espectro
-            Color da = gs == 3 ? Color.FromArgb(34, 150, 64) : (gs == 1 ? Color.FromArgb(70, 200, 250) : (gs == 2 ? Color.FromArgb(34, 211, 238) : Color.FromArgb(99, 102, 241)));
-            Color db = gs == 3 ? Color.FromArgb(110, 220, 120) : (gs == 1 ? Color.FromArgb(12, 140, 210) : (gs == 2 ? Color.FromArgb(167, 139, 250) : Color.FromArgb(251, 146, 60)));
+            int gs = cbGraphStyle.SelectedIndex;   // 0 colorido, 1 azul arredondado, 2 waveform (RTA espelhado), 3 espectro, 4 waveform continuo
+            Color da = gs == 5 ? Color.FromArgb(38, 140, 50) : gs == 3 ? Color.FromArgb(34, 150, 64) : (gs == 1 ? Color.FromArgb(70, 200, 250) : (gs == 2 || gs == 4 ? Color.FromArgb(34, 211, 238) : Color.FromArgb(99, 102, 241)));
+            Color db = gs == 5 ? Color.FromArgb(38, 140, 50) : gs == 3 ? Color.FromArgb(110, 220, 120) : (gs == 1 ? Color.FromArgb(12, 140, 210) : (gs == 2 || gs == 4 ? Color.FromArgb(167, 139, 250) : Color.FromArgb(251, 146, 60)));
             btnColA.BackColor = graphColA.Length > 0 ? Overlay.Parse(graphColA, da) : da;
             btnColB.BackColor = graphColB.Length > 0 ? Overlay.Parse(graphColB, db) : db;
         }
@@ -2308,7 +2483,7 @@ namespace TempOverlay
             if (sel != null) { c.CityName = sel.Name; c.CityDesc = sel.Desc; c.Lat = sel.Lat; c.Lon = sel.Lon; }
             c.Autostart = chkAuto.Checked; c.AutoUpdate = chkUpd.Checked;
             c.AirIp = tbAirIp.Text.Trim(); c.AirChannels = tbAirCh.Text.Trim().Length == 0 ? "1" : tbAirCh.Text.Trim();
-            c.GraphCh = tbGraphCh.Text.Trim().Length == 0 ? "1" : tbGraphCh.Text.Trim(); c.GraphLabel = tbGraphLabel.Text.Trim(); c.GraphStyle = cbGraphStyle.SelectedIndex == 3 ? "spectrum" : (cbGraphStyle.SelectedIndex == 2 ? "wave" : (cbGraphStyle.SelectedIndex == 1 ? "pill" : "gradient")); c.GraphReflect = chkReflect.Checked;
+            c.GraphCh = tbGraphCh.Text.Trim().Length == 0 ? "1" : tbGraphCh.Text.Trim(); c.GraphLabel = tbGraphLabel.Text.Trim(); c.GraphStyle = cbGraphStyle.SelectedIndex == 5 ? "speq" : cbGraphStyle.SelectedIndex == 4 ? "scroll" : (cbGraphStyle.SelectedIndex == 3 ? "spectrum" : (cbGraphStyle.SelectedIndex == 2 ? "wave" : (cbGraphStyle.SelectedIndex == 1 ? "pill" : "gradient"))); c.GraphReflect = chkReflect.Checked;
             c.GraphColorA = graphColA; c.GraphColorB = graphColB; c.GraphGain = (int)nudGain.Value;
             c.AirFader = chkAirFader.Checked; c.AirText = tbAirText.Text.Trim().Length == 0 ? "NO AR" : tbAirText.Text.Trim();
             c.Save(); AppCtx.SetAutostart(c.Autostart);
