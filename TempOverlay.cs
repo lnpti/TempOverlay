@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.6.2.0")]
+[assembly: AssemblyVersion("1.6.3.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.6.2";
+        public const string Version = "1.6.3";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
