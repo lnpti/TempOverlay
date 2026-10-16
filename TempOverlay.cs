@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.6.0.0")]
+[assembly: AssemblyVersion("1.6.1.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.6.0";
+        public const string Version = "1.6.1";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -2069,7 +2069,7 @@ namespace TempOverlay
             cbGraphStyle.SelectedIndexChanged += delegate { RefreshGraphSwatches(); };
             RefreshGraphSwatches();
             Button btnAirTest = Btn("Testar conexão", 14, 420, 150);
-            Label hR = Lbl("Painel 3: o app aponta o RTA da mesa para o canal escolhido. Painel 2 + RTA: usa a fonte do RTA da mesa.", 14, 458, 380);
+            Label hR = Lbl("Canal do gráfico: 1 a 32 ou aux1 a aux8. Painel 3: o app aponta o RTA da mesa para ele.", 14, 458, 380);
             hR.ForeColor = Ink2; hR.Height = 40;
             lblAirTest = new Label { Left = 14, Top = 502, Width = 380, Height = 70, Text = "", ForeColor = Ink };
             btnAirTest.Click += delegate
@@ -2093,7 +2093,7 @@ namespace TempOverlay
             };
             t4.Controls.AddRange(new Control[] { hA, Lbl("IP da mesa X32", 14, 38, 210), Lbl("Texto do aviso no ar", 230, 38, 180), tbAirIp, tbAirText,
                 Lbl("Canais do aviso NO AR", 14, 94, 380), tbAirCh, hC, chkAirFader,
-                Lbl("Canal (1-32)", 14, 232, 90), Lbl("Rótulo do gráfico", 108, 232, 170), Lbl("Sensib. (%)", 292, 232, 90),
+                Lbl("Canal ou aux", 14, 232, 90), Lbl("Rótulo do gráfico", 108, 232, 170), Lbl("Sensib. (%)", 292, 232, 90),
                 tbGraphCh, tbGraphLabel, nudGain,
                 Lbl("Aparência do gráfico", 14, 290, 200), cbGraphStyle, chkReflect,
                 Lbl("Cores do gráfico (degradê da Cor 1 para a Cor 2)", 14, 348, 400), btnColA, btnColB, btnColReset,
