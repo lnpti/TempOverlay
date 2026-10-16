@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.6.5.0")]
+[assembly: AssemblyVersion("1.6.6.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.6.5";
+        public const string Version = "1.6.6";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -463,6 +463,7 @@ namespace TempOverlay
     {
         public static int Port = 10023;      // X32 = 10023, XR-18/X Air = 10024
         public static bool XAir;            // true quando a mesa e uma XR-18 / X Air
+        public static string RtaPath { get { return XAir ? "/meters/4" : "/meters/15"; } }   // RTA: 100 faixas int16/256 dB (X32: banco 15; XR-18: banco 4, confirmado no diagnostico)
         public static void SetMixer(string type) { XAir = type == "xair"; Port = XAir ? 10024 : 10023; }
 
         static byte[] Pad(string s)
@@ -615,7 +616,7 @@ namespace TempOverlay
         public static byte[] RtaSubscribePacket(int timeFactor = 4)
         {
             List<byte> b = new List<byte>();
-            b.AddRange(Pad("/meters")); b.AddRange(Pad(",siii")); b.AddRange(Pad("/meters/15"));
+            b.AddRange(Pad("/meters")); b.AddRange(Pad(",siii")); b.AddRange(Pad(RtaPath));
             foreach (int v in new int[] { 0, 0, timeFactor })   // canal, grupo, fator de tempo (N x 50 ms)
             {
                 byte[] i = BitConverter.GetBytes(v); Array.Reverse(i); b.AddRange(i);
@@ -627,7 +628,7 @@ namespace TempOverlay
         {
             db = null;
             int z = Array.IndexOf(d, (byte)0, 0, len); if (z <= 0) return false;
-            if (Encoding.ASCII.GetString(d, 0, z) != "/meters/15") return false;
+            if (Encoding.ASCII.GetString(d, 0, z) != RtaPath) return false;
             int p = Al(z);
             if (p + 1 >= len || d[p] != (byte)',' || d[p + 1] != (byte)'b') return false;
             int z2 = Array.IndexOf(d, (byte)0, p, len - p); if (z2 < 0) return false;
@@ -677,6 +678,14 @@ namespace TempOverlay
         public static GraphSrc ParseGraphSource(string token)
         {
             string t = (token ?? "").Trim().ToLowerInvariant();
+            if (XAir)   // XR-18: canais 1-16; o nivel de cada um vem em /meters/1 (int16/256 em dB, canal 1 no primeiro valor)
+            {
+                Match mx = Regex.Match(t, "^(ch)?(\\d+)$");
+                if (!mx.Success) return null;
+                int nx = int.Parse(mx.Groups[2].Value);
+                if (nx < 1 || nx > 16) return null;
+                return new GraphSrc { Name = "Canal " + nx, RtaIndex = nx - 1, MeterPath = "/meters/1", MeterIdx = nx - 1 };
+            }
             Match m = Regex.Match(t, "^(ch|aux|auxin|bus)?(\\d+)$");
             if (!m.Success) return null;
             int n = int.Parse(m.Groups[2].Value); string kind = m.Groups[1].Value;
@@ -705,7 +714,15 @@ namespace TempOverlay
             p += Al(z2 - p);
             if (p + 8 > len) return false;
             p += 4;                                       // tamanho do blob (big-endian)
-            int n = BitConverter.ToInt32(d, p); p += 4;   // quantidade de floats (little-endian)
+            int n = BitConverter.ToInt32(d, p); p += 4;   // quantidade de valores (little-endian)
+            if (XAir)   // XR-18: int16/256 em dB -> nivel 0..1 (-60 dB .. 0 dB)
+            {
+                int av = (len - p) / 2; if (n <= 0 || n > av) n = av;
+                if (n < 1) return false;
+                vals = new float[n];
+                for (int i = 0; i < n; i++) vals[i] = Math.Max(0f, Math.Min(1f, (BitConverter.ToInt16(d, p + 2 * i) / 256f + 60f) / 60f));
+                return true;
+            }
             int avail = (len - p) / 4;
             if (n <= 0 || n > avail) n = avail;
             if (n < 1) return false;
@@ -717,7 +734,7 @@ namespace TempOverlay
         public static string MeterProbe(string ip, string token)
         {
             GraphSrc gs = ParseGraphSource(token);
-            if (gs == null) return "Gráfico: use um canal de 1 a 32, aux1 a aux8 ou bus1 a bus16.";
+            if (gs == null) return XAir ? "Gráfico: use um canal de 1 a 16." : "Gráfico: use um canal de 1 a 32, aux1 a aux8 ou bus1 a bus16.";
             string name = gs.Name, path = gs.MeterPath; int idx = gs.MeterIdx;
             IPAddress addr; if (!IPAddress.TryParse(ip, out addr)) return "Gráfico: IP invalido.";
             using (UdpClient u = new UdpClient(AddressFamily.InterNetwork))
@@ -762,12 +779,12 @@ namespace TempOverlay
         public static string GraphProbe(string ip, string token)
         {
             string name; int idx = MeterIndex(token, out name);
-            if (idx < 0) return "Gráfico: use um canal de 1 a 32, aux1 a aux8 ou bus1 a bus16.";
+            if (idx < 0) return XAir ? "Gráfico: use um canal de 1 a 16." : "Gráfico: use um canal de 1 a 32, aux1 a aux8 ou bus1 a bus16.";
             IPAddress addr; if (!IPAddress.TryParse(ip, out addr)) return "Gráfico: IP invalido.";
             using (UdpClient u = new UdpClient(AddressFamily.InterNetwork))
             {
                 IPEndPoint ep = new IPEndPoint(addr, Port);
-                byte[] src = SetRtaSourcePacket(idx); u.Send(src, src.Length, ep);
+                if (!XAir) { byte[] src = SetRtaSourcePacket(idx); u.Send(src, src.Length, ep); }   // na XR-18 a fonte do RTA se escolhe na propria mesa
                 byte[] sub = RtaSubscribePacket(); u.Send(sub, sub.Length, ep);
                 DateTime end = DateTime.UtcNow.AddMilliseconds(2500);
                 while (true)
@@ -781,6 +798,7 @@ namespace TempOverlay
                         if (ParseRta(d, d.Length, out db))
                         {
                             float max = -128; foreach (float v in db) max = Math.Max(max, v);
+                            if (XAir) return "Gráfico: RTA da XR-18 recebendo (" + db.Length + " faixas, pico " + max.ToString("0.#", CultureInfo.InvariantCulture) + " dB). Mostra a fonte escolhida no RTA da própria mesa.";
                             return "Gráfico: RTA da mesa apontado para " + name + " (" + db.Length + " faixas, pico " + max.ToString("0.#", CultureInfo.InvariantCulture) + " dB). Fale no canal para as barras subirem.";
                         }
                     }
@@ -1962,7 +1980,7 @@ namespace TempOverlay
             while (!exiting)
             {
                 string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
-                if (X32.XAir || !((Cfg.HasRta || (Cfg.HasGraph && Cfg.GraphStyle != "scroll")) && IPAddress.TryParse(ip, out a)))
+                if (!((Cfg.HasRta || (Cfg.HasGraph && Cfg.GraphStyle != "scroll")) && IPAddress.TryParse(ip, out a)))
                 {
                     if (u != null) { u.Close(); u = null; }
                     if (rta != null) { rta = null; Post(delegate { Render(); }); }
@@ -1975,7 +1993,7 @@ namespace TempOverlay
                         if (u != null) u.Close();
                         u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), X32.Port); curIp = ip; lastSub = DateTime.MinValue; curSrc = null; rtaLogged = false;
                     }
-                    string wantSrc = (Cfg.HasGraph && Cfg.GraphStyle != "scroll") ? (Cfg.GraphCh ?? "") : "";
+                    string wantSrc = (Cfg.HasGraph && Cfg.GraphStyle != "scroll" && !X32.XAir) ? (Cfg.GraphCh ?? "") : "";
                     if (wantSrc != curSrc)   // Painel 3: aponta o RTA da mesa para o canal escolhido nas configuracoes
                     {
                         curSrc = wantSrc; string nm; int si = X32.MeterIndex(wantSrc, out nm);
@@ -2025,7 +2043,7 @@ namespace TempOverlay
             while (!exiting)
             {
                 string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
-                if (X32.XAir || !(Cfg.HasGraph && Cfg.GraphStyle == "scroll" && IPAddress.TryParse(ip, out a)))
+                if (!(Cfg.HasGraph && Cfg.GraphStyle == "scroll" && IPAddress.TryParse(ip, out a)))
                 {
                     if (u != null) { u.Close(); u = null; }
                     Thread.Sleep(1000); continue;
@@ -2365,7 +2383,7 @@ namespace TempOverlay
                 bool xa = cbMixer.SelectedIndex == 1;
                 hC.Text = xa ? "Ex.: 1 (microfone), 1,2,5, aux, rtn1, bus1, main, dca2. O aviso acende se qualquer um dos canais estiver aberto."
                              : "Ex.: 1 (microfone), 1,2,5, aux1, bus3, main, dca2. O aviso acende se qualquer um dos canais estiver aberto.";
-                if (hMixer != null) hMixer.Text = xa ? "XR-18: o aviso NO AR e o cronômetro funcionam. Os gráficos ainda não (use o diagnóstico)." : "";
+                if (hMixer != null) hMixer.Text = xa ? "XR-18: barras e espectro mostram a fonte do RTA escolhida na mesa; o Waveform contínuo, o nível do canal (1-16)." : "";
                 if (btnDiag != null) btnDiag.Visible = xa;
             };
             chkAirFader = new CheckBox { Text = "Considerar o fader (aberto se acima de -60 dB)", Left = 14, Top = 186, Width = 380, Checked = c.AirFader };
