@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.6.4.0")]
+[assembly: AssemblyVersion("1.6.5.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.6.4";
+        public const string Version = "1.6.5";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -85,7 +85,7 @@ namespace TempOverlay
         public int Scale = 100;
         public string AirIp = "", AirChannels = "1", AirText = "NO AR";
         public bool AirFader = true;
-        public string GraphCh = "1", GraphLabel = "", GraphStyle = "gradient", GraphColorA = "", GraphColorB = "";
+        public string GraphCh = "1", GraphLabel = "", GraphStyle = "gradient", GraphColorA = "", GraphColorB = "", MixerType = "x32";
         public bool GraphReflect;
         public int GraphGain = 100;
 
@@ -125,7 +125,8 @@ namespace TempOverlay
                 c.AirText = Json.S(d, "air_text", "NO AR"); c.AirFader = Json.B(d, "air_fader", true);
                 c.GraphCh = Json.S(d, "graph_ch", "1"); c.GraphLabel = Json.S(d, "graph_label", "");
                 c.GraphStyle = Json.S(d, "graph_style", "gradient"); c.GraphReflect = Json.B(d, "graph_reflect", false);
-                c.GraphColorA = Json.S(d, "graph_color_a", ""); c.GraphColorB = Json.S(d, "graph_color_b", ""); c.GraphGain = Math.Max(10, Math.Min(400, Json.I(d, "graph_gain", 100)));
+                c.GraphColorA = Json.S(d, "graph_color_a", ""); c.GraphColorB = Json.S(d, "graph_color_b", "");
+                c.MixerType = Json.S(d, "mixer_type", "x32"); c.GraphGain = Math.Max(10, Math.Min(400, Json.I(d, "graph_gain", 100)));
             }
             catch { }
             return c;
@@ -148,7 +149,7 @@ namespace TempOverlay
                 r("locked", b(Locked)); r("x", X.ToString()); r("y", Y.ToString()); r("autostart", b(Autostart));
                 r("auto_update", b(AutoUpdate)); r("show_clock", b(ShowClock)); r("show_seconds", b(ShowSeconds));
                 r("show_date", b(ShowDate)); r("show_icon", b(ShowIcon)); s("logo_path", LogoPath); r("scale", Scale.ToString());
-                s("air_ip", AirIp); s("air_channels", AirChannels); s("air_text", AirText); r("air_fader", b(AirFader)); s("graph_ch", GraphCh); s("graph_label", GraphLabel); s("graph_style", GraphStyle); r("graph_reflect", b(GraphReflect)); s("graph_color_a", GraphColorA); s("graph_color_b", GraphColorB); r("graph_gain", GraphGain.ToString());
+                s("air_ip", AirIp); s("air_channels", AirChannels); s("air_text", AirText); r("air_fader", b(AirFader)); s("graph_ch", GraphCh); s("graph_label", GraphLabel); s("graph_style", GraphStyle); r("graph_reflect", b(GraphReflect)); s("graph_color_a", GraphColorA); s("graph_color_b", GraphColorB); s("mixer_type", MixerType); r("graph_gain", GraphGain.ToString());
                 sb.Append("  \"last_update_check\": " + LastUpdateCheck.ToString("R", CultureInfo.InvariantCulture) + "\n}\n");
                 File.WriteAllText(FilePath, sb.ToString(), new UTF8Encoding(false));
             }
@@ -457,10 +458,12 @@ namespace TempOverlay
         }
     }
 
-    // ---------- Behringer X32 (OSC por UDP, porta 10023): canal aberto/mudo + fader ----------
+    // ---------- Behringer X32 (OSC/UDP porta 10023) e XR-18 / X Air (porta 10024): canal aberto/mudo + fader ----------
     static class X32
     {
-        const int Port = 10023;
+        public static int Port = 10023;      // X32 = 10023, XR-18/X Air = 10024
+        public static bool XAir;            // true quando a mesa e uma XR-18 / X Air
+        public static void SetMixer(string type) { XAir = type == "xair"; Port = XAir ? 10024 : 10023; }
 
         static byte[] Pad(string s)
         {
@@ -516,6 +519,7 @@ namespace TempOverlay
         // "1", "ch2", "aux1", "bus3", "mtx2", "dca4", "main", "mono"  ->  enderecos OSC de on/fader
         public static List<string[]> Tokens(string channels)
         {
+            if (XAir) return TokensXAir(channels);
             List<string[]> list = new List<string[]>();
             foreach (string raw in Regex.Split(channels ?? "", "[,; ]+"))
             {
@@ -536,6 +540,75 @@ namespace TempOverlay
                 if (bas != null) list.Add(new string[] { bas + "/on", bas + "/fader", name });
             }
             return list;
+        }
+
+        // XR-18 / X Air: "1".."16" | "ch3" | "aux" | "rtn1".."rtn4" | "bus1".."bus6" | "main" | "dca1".."dca4"
+        static List<string[]> TokensXAir(string channels)
+        {
+            List<string[]> list = new List<string[]>();
+            foreach (string raw in Regex.Split(channels ?? "", "[,; ]+"))
+            {
+                string t = raw.Trim().ToLowerInvariant(); if (t.Length == 0) continue;
+                string bas = null, name = t;
+                Match m = Regex.Match(t, "^(ch|rtn|fx|bus|dca)?(\\d+)$");
+                if (m.Success)
+                {
+                    int n = int.Parse(m.Groups[2].Value); string kind = m.Groups[1].Value;
+                    if ((kind == "" || kind == "ch") && n >= 1 && n <= 16) { bas = "/ch/" + n.ToString("00") + "/mix"; name = "Canal " + n; }
+                    else if ((kind == "rtn" || kind == "fx") && n >= 1 && n <= 4) { bas = "/rtn/" + n + "/mix"; name = "Retorno FX " + n; }
+                    else if (kind == "bus" && n >= 1 && n <= 6) { bas = "/bus/" + n + "/mix"; name = "Bus " + n; }
+                    else if (kind == "dca" && n >= 1 && n <= 4) { bas = "/dca/" + n; name = "DCA " + n; }
+                }
+                else if (t == "aux" || t == "auxr" || t == "aux17") { bas = "/rtn/aux/mix"; name = "Aux (17-18)"; }
+                else if (t == "main" || t == "st" || t == "lr") { bas = "/lr/mix"; name = "Main LR"; }
+                if (bas != null) list.Add(new string[] { bas + "/on", bas + "/fader", name });
+            }
+            return list;
+        }
+
+        // diagnostico de medidores (bancos /meters/0..6): mostra o que a mesa envia, para calibrar graficos em mesas novas (XR-18)
+        public static string ProbeMeters(string ip)
+        {
+            IPAddress addr; if (!IPAddress.TryParse(ip, out addr)) return "Diagnóstico: IP inválido.";
+            StringBuilder sb = new StringBuilder();
+            Dictionary<string, string> found = new Dictionary<string, string>();
+            using (UdpClient u = new UdpClient(AddressFamily.InterNetwork))
+            {
+                IPEndPoint ep = new IPEndPoint(addr, Port);
+                for (int n = 0; n <= 6; n++) { byte[] sub = MeterSubscribePacket("/meters/" + n, 4); u.Send(sub, sub.Length, ep); }
+                DateTime end = DateTime.UtcNow.AddMilliseconds(3000);
+                while (true)
+                {
+                    int left = (int)(end - DateTime.UtcNow).TotalMilliseconds; if (left <= 0) break;
+                    u.Client.ReceiveTimeout = left;
+                    try
+                    {
+                        IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                        byte[] d = u.Receive(ref from);
+                        int z = Array.IndexOf(d, (byte)0, 0, d.Length); if (z <= 0) continue;
+                        string path = Encoding.ASCII.GetString(d, 0, z);
+                        if (!path.StartsWith("/meters/") || found.ContainsKey(path)) continue;
+                        int p = Al(z); int z2 = Array.IndexOf(d, (byte)0, p, d.Length - p); if (z2 < 0) continue;
+                        p += Al(z2 - p) + 4;                              // pula o tamanho do blob
+                        if (p + 4 > d.Length) continue;
+                        int cnt = BitConverter.ToInt32(d, p); p += 4;
+                        StringBuilder v16 = new StringBuilder(), vf = new StringBuilder();
+                        for (int i = 0; i < 6 && p + 2 * (i + 1) <= d.Length; i++) v16.Append((BitConverter.ToInt16(d, p + 2 * i) / 256f).ToString("0.#", CultureInfo.InvariantCulture) + " ");
+                        for (int i = 0; i < 4 && p + 4 * (i + 1) <= d.Length; i++) vf.Append(BitConverter.ToSingle(d, p + 4 * i).ToString("0.###", CultureInfo.InvariantCulture) + " ");
+                        found[path] = path + ": " + d.Length + " bytes, " + cnt + " valores | como int16/256: " + v16.ToString().Trim() + " | como float: " + vf.ToString().Trim();
+                    }
+                    catch (SocketException) { break; }
+                }
+            }
+            if (found.Count == 0) return "Diagnóstico: a mesa não enviou medidores (confira o IP e a porta " + Port + ").";
+            foreach (KeyValuePair<string, string> kv in found) sb.AppendLine(kv.Value);
+            try
+            {
+                Directory.CreateDirectory(Config.Dir);
+                File.AppendAllText(Path.Combine(Config.Dir, "rede.log"), DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " DIAGNOSTICO DE MEDIDORES (porta " + Port + ")" + Environment.NewLine + sb.ToString());
+            }
+            catch { }
+            return "Diagnóstico gravado em rede.log:\n" + sb.ToString().Trim();
         }
 
         // ---- RTA: assina o medidor 15 (100 faixas de espectro, int16 little-endian, dB = valor/256) ----
@@ -747,8 +820,8 @@ namespace TempOverlay
             List<string> addrs = new List<string>();
             foreach (string[] t in tk) { addrs.Add(t[0]); addrs.Add(t[1]); }
             Dictionary<string, float> r = Query(ip, addrs, 1500);
-            if (r.Count == 0) return "Sem resposta da mesa em " + ip + " (porta 10023). Confira o IP e se o PC está na mesma rede da X32.";
-            StringBuilder sb = new StringBuilder("Conectado à X32.\n");
+            if (r.Count == 0) return "Sem resposta da mesa em " + ip + " (porta " + Port + "). Confira o IP e se o PC está na mesma rede da " + (XAir ? "XR-18" : "X32") + ".";
+            StringBuilder sb = new StringBuilder(XAir ? "Conectado à XR-18.\n" : "Conectado à X32.\n");
             foreach (string[] t in tk)
             {
                 float on, f; bool ho = r.TryGetValue(t[0], out on), hf = r.TryGetValue(t[1], out f);
@@ -930,7 +1003,7 @@ namespace TempOverlay
         }
 
         // ---------- placa "NO AR" (vermelha) ----------
-        static string PlateText(Config c, int state) { return state == 1 ? c.AirText : (state == 0 ? "FORA DO AR" : "SEM X32"); }
+        static string PlateText(Config c, int state) { return state == 1 ? c.AirText : (state == 0 ? "FORA DO AR" : "SEM MESA"); }
         static SizeF PlateSize(Graphics pg, Font f, StringFormat sf, Config c, float k, out float dot)
         {
             float w = 0;
@@ -1828,6 +1901,7 @@ namespace TempOverlay
 
         public AppCtx()
         {
+            X32.SetMixer(Cfg.MixerType);
             Ov.ClickThrough = Cfg.Locked;
             Ov.Pos = new Point(Cfg.X, Cfg.Y);
             Ov.ScaleRequested += delegate(int pct) { Cfg.Scale = pct; Render(); if (settings != null && !settings.IsDisposed) settings.SyncScale(pct); };
@@ -1888,7 +1962,7 @@ namespace TempOverlay
             while (!exiting)
             {
                 string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
-                if (!((Cfg.HasRta || (Cfg.HasGraph && Cfg.GraphStyle != "scroll")) && IPAddress.TryParse(ip, out a)))
+                if (X32.XAir || !((Cfg.HasRta || (Cfg.HasGraph && Cfg.GraphStyle != "scroll")) && IPAddress.TryParse(ip, out a)))
                 {
                     if (u != null) { u.Close(); u = null; }
                     if (rta != null) { rta = null; Post(delegate { Render(); }); }
@@ -1899,7 +1973,7 @@ namespace TempOverlay
                     if (u == null || ip != curIp)
                     {
                         if (u != null) u.Close();
-                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue; curSrc = null; rtaLogged = false;
+                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), X32.Port); curIp = ip; lastSub = DateTime.MinValue; curSrc = null; rtaLogged = false;
                     }
                     string wantSrc = (Cfg.HasGraph && Cfg.GraphStyle != "scroll") ? (Cfg.GraphCh ?? "") : "";
                     if (wantSrc != curSrc)   // Painel 3: aponta o RTA da mesa para o canal escolhido nas configuracoes
@@ -1951,7 +2025,7 @@ namespace TempOverlay
             while (!exiting)
             {
                 string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
-                if (!(Cfg.HasGraph && Cfg.GraphStyle == "scroll" && IPAddress.TryParse(ip, out a)))
+                if (X32.XAir || !(Cfg.HasGraph && Cfg.GraphStyle == "scroll" && IPAddress.TryParse(ip, out a)))
                 {
                     if (u != null) { u.Close(); u = null; }
                     Thread.Sleep(1000); continue;
@@ -1961,7 +2035,7 @@ namespace TempOverlay
                     if (u == null || ip != curIp)
                     {
                         if (u != null) u.Close();
-                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue;
+                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), X32.Port); curIp = ip; lastSub = DateTime.MinValue;
                     }
                     GraphSrc gsrc = X32.ParseGraphSource(Cfg.GraphCh);
                     string wantPath = gsrc == null ? "/meters/1" : gsrc.MeterPath;
@@ -2031,7 +2105,7 @@ namespace TempOverlay
             Ov.RtaTop = Math.Max(rtaTop, -75f);   // nao amplifica silencio/ruido alem de -75 dB
             { string gn; X32.MeterIndex(Cfg.GraphCh, out gn); Ov.GraphName = Cfg.GraphLabel.Trim().Length > 0 ? Cfg.GraphLabel.Trim() : gn; }
             Ov.AirSince = airSinceTicks > 0 ? new DateTime(airSinceTicks) : DateTime.MinValue;
-            string tip = (Cfg.HasAir && Cfg.AirIp.Trim().Length > 0 && airState < 0) ? "TempOverlay - X32 sem resposta" : Const.App;
+            string tip = (Cfg.HasAir && Cfg.AirIp.Trim().Length > 0 && airState < 0) ? "TempOverlay - mesa sem resposta" : Const.App;
             if (tip != lastTip) { lastTip = tip; ni.Text = tip; }   // so mexe na bandeja quando muda (o grafico redesenha varias vezes por segundo)
             Ov.WeatherCode = Cfg.Lat.HasValue ? code : -1;
             Ov.ReserveIcon = Cfg.Lat.HasValue;   // reserva o espaco do icone para o painel nao mudar de tamanho quando ele chega
@@ -2171,7 +2245,7 @@ namespace TempOverlay
         NumericUpDown nudRef, nudDec, nudSize;
         TrackBar tbOpacity;
         CheckBox chkLabel, chkLock, chkAuto, chkUpd, chkClock, chkSec, chkDate, chkIcon;
-        TextBox tbAirIp, tbAirCh, tbAirText, tbGraphCh, tbGraphLabel; ComboBox cbGraphStyle; CheckBox chkReflect;
+        TextBox tbAirIp, tbAirCh, tbAirText, tbGraphCh, tbGraphLabel; ComboBox cbGraphStyle, cbMixer; CheckBox chkReflect; Label hMixer; Button btnDiag;
         Button btnColA, btnColB; string graphColA = "", graphColB = ""; CheckBox chkAirFader; Label lblAirTest; NumericUpDown nudGain;
         TextBox tbLogo; Button btnLogo; NumericUpDown nudScale;
 
@@ -2277,12 +2351,23 @@ namespace TempOverlay
             t3.Controls.AddRange(new Control[] { chkLock, chkAuto, chkUpd, btnUpd, h3, Lbl("Posição X", 14, 268, 80), nudX, Lbl("Y", 196, 268, 24), nudY });
 
             // --- NO AR (Behringer X32) ---
-            Label hA = Lbl("Usado nos estilos \"+ NO AR\" (aba Aparência).", 14, 14, 380); hA.ForeColor = Ink2;
+            cbMixer = new ComboBox { Left = 66, Top = 10, Width = 330, DropDownStyle = ComboBoxStyle.DropDownList };
+            cbMixer.Items.AddRange(new object[] { "Behringer X32 (porta 10023)", "Behringer XR-18 / X Air (porta 10024)" });
+            cbMixer.SelectedIndex = c.MixerType == "xair" ? 1 : 0;
+            Label hA = Lbl("Mesa", 14, 14, 50);
             tbAirIp = new TextBox { Left = 14, Top = 60, Width = 200, Text = c.AirIp };
             tbAirText = new TextBox { Left = 230, Top = 60, Width = 180, Text = c.AirText };
             tbAirCh = new TextBox { Left = 14, Top = 116, Width = 400, Text = c.AirChannels };
-            Label hC = Lbl("Ex.: 1 (microfone), 1,2,5, aux1, bus3, main, dca2. O aviso acende se qualquer um dos canais estiver aberto.", 14, 142, 380);
+            Label hC = Lbl("", 14, 142, 380);
             hC.ForeColor = Ink2; hC.Height = 40;
+            Action refreshMixerTexts = delegate
+            {
+                bool xa = cbMixer.SelectedIndex == 1;
+                hC.Text = xa ? "Ex.: 1 (microfone), 1,2,5, aux, rtn1, bus1, main, dca2. O aviso acende se qualquer um dos canais estiver aberto."
+                             : "Ex.: 1 (microfone), 1,2,5, aux1, bus3, main, dca2. O aviso acende se qualquer um dos canais estiver aberto.";
+                if (hMixer != null) hMixer.Text = xa ? "XR-18: o aviso NO AR e o cronômetro funcionam. Os gráficos ainda não (use o diagnóstico)." : "";
+                if (btnDiag != null) btnDiag.Visible = xa;
+            };
             chkAirFader = new CheckBox { Text = "Considerar o fader (aberto se acima de -60 dB)", Left = 14, Top = 186, Width = 380, Checked = c.AirFader };
             tbGraphCh = new TextBox { Left = 14, Top = 254, Width = 80, Text = c.GraphCh };
             tbGraphLabel = new TextBox { Left = 108, Top = 254, Width = 170, Text = c.GraphLabel };
@@ -2300,12 +2385,28 @@ namespace TempOverlay
             cbGraphStyle.SelectedIndexChanged += delegate { RefreshGraphSwatches(); };
             RefreshGraphSwatches();
             Button btnAirTest = Btn("Testar conexão", 14, 420, 150);
-            Label hR = Lbl("Canal do gráfico: 1-32, aux1-8 ou bus1-16. Painel 3: o app aponta o RTA da mesa para ele.", 14, 458, 380);
+            btnDiag = Btn("Diagnóstico de medidores", 174, 420, 210);
+            hMixer = Lbl("", 14, 458, 380); hMixer.ForeColor = Color.FromArgb(0x9A, 0x34, 0x12); hMixer.Height = 40;
+            btnDiag.Click += delegate
+            {
+                string ip = tbAirIp.Text.Trim(); X32.SetMixer(cbMixer.SelectedIndex == 1 ? "xair" : "x32");
+                lblAirTest.ForeColor = Ink2; lblAirTest.Text = "Pedindo os medidores à mesa (3 s)...";
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    string r; try { r = X32.ProbeMeters(ip); } catch (Exception ex) { r = "Erro: " + ex.Message; }
+                    try { BeginInvoke((Action)delegate { lblAirTest.ForeColor = Ink; lblAirTest.Text = r; }); } catch { }
+                });
+            };
+            cbMixer.SelectedIndexChanged += delegate { refreshMixerTexts(); };
+            Label hR = Lbl("Canal do gráfico (X32): 1-32, aux1-8 ou bus1-16. Painel 3: o app aponta o RTA da mesa para ele.", 14, 458, 380);
             hR.ForeColor = Ink2; hR.Height = 40;
-            lblAirTest = new Label { Left = 14, Top = 502, Width = 380, Height = 70, Text = "", ForeColor = Ink };
+            hR.Visible = cbMixer.SelectedIndex != 1;   // na XR-18 aparece o aviso especifico dela no lugar
+            cbMixer.SelectedIndexChanged += delegate { hR.Visible = cbMixer.SelectedIndex != 1; };
+            lblAirTest = new Label { Left = 14, Top = 506, Width = 380, Height = 80, Text = "", ForeColor = Ink };
             btnAirTest.Click += delegate
             {
                 string ip = tbAirIp.Text.Trim(), ch = tbAirCh.Text, gch = tbGraphCh.Text;
+                X32.SetMixer(cbMixer.SelectedIndex == 1 ? "xair" : "x32");
                 string styleKey = StyleKeys[Math.Max(0, cbStyle.SelectedIndex)];
                 bool wantRta = styleKey == "panel2_air_rta", wantGraph = styleKey == "panel3_air_graph", wantWave = cbGraphStyle.SelectedIndex == 4;
                 lblAirTest.ForeColor = Ink2; lblAirTest.Text = "Consultando a mesa...";
@@ -2322,13 +2423,14 @@ namespace TempOverlay
                     try { BeginInvoke((Action)delegate { lblAirTest.ForeColor = r.StartsWith("Conectado") ? Color.FromArgb(0x16, 0x65, 0x34) : Ink; lblAirTest.Text = r; }); } catch { }
                 });
             };
-            t4.Controls.AddRange(new Control[] { hA, Lbl("IP da mesa X32", 14, 38, 210), Lbl("Texto do aviso no ar", 230, 38, 180), tbAirIp, tbAirText,
+            t4.Controls.AddRange(new Control[] { hA, cbMixer, Lbl("IP da mesa", 14, 38, 210), Lbl("Texto do aviso no ar", 230, 38, 180), tbAirIp, tbAirText,
                 Lbl("Canais do aviso NO AR", 14, 94, 380), tbAirCh, hC, chkAirFader,
                 Lbl("Canal/aux/bus", 14, 232, 94), Lbl("Rótulo do gráfico", 108, 232, 170), Lbl("Sensib. (%)", 292, 232, 90),
                 tbGraphCh, tbGraphLabel, nudGain,
                 Lbl("Aparência do gráfico", 14, 290, 200), cbGraphStyle, chkReflect,
                 Lbl("Cores do gráfico (degradê da Cor 1 para a Cor 2)", 14, 348, 400), btnColA, btnColB, btnColReset,
-                btnAirTest, hR, lblAirTest });
+                btnAirTest, btnDiag, hR, hMixer, lblAirTest });
+            refreshMixerTexts();
 
             // --- rodape ---
             Button bc = Btn("Cancelar", 150, 622, 90), ba = Btn("Aplicar", 248, 622, 90), bs = Btn("Salvar", 346, 622, 100);
@@ -2482,6 +2584,7 @@ namespace TempOverlay
             c.Source = city ? "city" : "txt"; c.TxtPath = tbTxt.Text.Trim(); c.RefreshMin = (int)nudRef.Value;
             if (sel != null) { c.CityName = sel.Name; c.CityDesc = sel.Desc; c.Lat = sel.Lat; c.Lon = sel.Lon; }
             c.Autostart = chkAuto.Checked; c.AutoUpdate = chkUpd.Checked;
+            c.MixerType = cbMixer.SelectedIndex == 1 ? "xair" : "x32"; X32.SetMixer(c.MixerType);
             c.AirIp = tbAirIp.Text.Trim(); c.AirChannels = tbAirCh.Text.Trim().Length == 0 ? "1" : tbAirCh.Text.Trim();
             c.GraphCh = tbGraphCh.Text.Trim().Length == 0 ? "1" : tbGraphCh.Text.Trim(); c.GraphLabel = tbGraphLabel.Text.Trim(); c.GraphStyle = cbGraphStyle.SelectedIndex == 5 ? "speq" : cbGraphStyle.SelectedIndex == 4 ? "scroll" : (cbGraphStyle.SelectedIndex == 3 ? "spectrum" : (cbGraphStyle.SelectedIndex == 2 ? "wave" : (cbGraphStyle.SelectedIndex == 1 ? "pill" : "gradient"))); c.GraphReflect = chkReflect.Checked;
             c.GraphColorA = graphColA; c.GraphColorB = graphColB; c.GraphGain = (int)nudGain.Value;
