@@ -22,14 +22,14 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: AssemblyTitle("TempOverlay")]
-[assembly: AssemblyVersion("1.5.0.0")]
+[assembly: AssemblyVersion("1.6.0.0")]
 
 namespace TempOverlay
 {
     static class Const
     {
         public const string App = "TempOverlay";
-        public const string Version = "1.5.0";
+        public const string Version = "1.6.0";
         public const string GithubRepo = "lnpti/TempOverlay";
         public const string R2Manifest = "https://pub-8060abbe70084968817647c74ce4ffbc.r2.dev/tempoverlay/latest.json";
         public const int UpdateHour = 3; // checagem de madrugada (alem de a cada 24 h)
@@ -604,6 +604,63 @@ namespace TempOverlay
             return -1;
         }
 
+        // ---- Waveform: nivel do canal por /meters/1 (floats little-endian: ch1-32, depois aux1-8) ----
+        public static bool ParseMeterFloats(byte[] d, int len, string path, out float[] vals)
+        {
+            vals = null;
+            int z = Array.IndexOf(d, (byte)0, 0, len); if (z <= 0) return false;
+            if (Encoding.ASCII.GetString(d, 0, z) != path) return false;
+            int p = Al(z);
+            if (p + 1 >= len || d[p] != (byte)',' || d[p + 1] != (byte)'b') return false;
+            int z2 = Array.IndexOf(d, (byte)0, p, len - p); if (z2 < 0) return false;
+            p += Al(z2 - p);
+            if (p + 8 > len) return false;
+            p += 4;                                       // tamanho do blob (big-endian)
+            int n = BitConverter.ToInt32(d, p); p += 4;   // quantidade de floats (little-endian)
+            int avail = (len - p) / 4;
+            if (n <= 0 || n > avail) n = avail;
+            if (n < 1) return false;
+            vals = new float[n];
+            for (int i = 0; i < n; i++) vals[i] = BitConverter.ToSingle(d, p + 4 * i);
+            return true;
+        }
+
+        public static string MeterProbe(string ip, string token)
+        {
+            string name; int idx = MeterIndex(token, out name);
+            if (idx < 0) return "Gráfico: use um canal de 1 a 32 (ou aux1 a aux8).";
+            IPAddress addr; if (!IPAddress.TryParse(ip, out addr)) return "Gráfico: IP invalido.";
+            using (UdpClient u = new UdpClient(AddressFamily.InterNetwork))
+            {
+                IPEndPoint ep = new IPEndPoint(addr, Port);
+                byte[] sub = MeterSubscribePacket("/meters/1", 3); u.Send(sub, sub.Length, ep);
+                DateTime end = DateTime.UtcNow.AddMilliseconds(2500);
+                float max = 0; int count = 0, n = 0;
+                while (true)
+                {
+                    int left = (int)(end - DateTime.UtcNow).TotalMilliseconds; if (left <= 0) break;
+                    u.Client.ReceiveTimeout = left;
+                    try
+                    {
+                        IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                        byte[] d = u.Receive(ref from); float[] v;
+                        if (ParseMeterFloats(d, d.Length, "/meters/1", out v) && idx < v.Length) { n = v.Length; count++; max = Math.Max(max, v[idx]); }
+                    }
+                    catch (SocketException) { break; }
+                }
+                if (count == 0) return "Waveform: sem dados do medidor. Confira o IP e a rede.";
+                return "Waveform: " + name + " recebendo (" + n + " medidores, maior nível " + max.ToString("0.00", CultureInfo.InvariantCulture) + "). Fale no canal e teste de novo para ver o nível subir.";
+            }
+        }
+
+        public static byte[] MeterSubscribePacket(string path, int timeFactor)
+        {
+            List<byte> b = new List<byte>();
+            b.AddRange(Pad("/meters")); b.AddRange(Pad(",siii")); b.AddRange(Pad(path));
+            foreach (int v in new int[] { 0, 0, timeFactor }) { byte[] i = BitConverter.GetBytes(v); Array.Reverse(i); b.AddRange(i); }
+            return b.ToArray();
+        }
+
         // /-prefs/rta/source ,i <indice>  : escolhe qual canal o RTA da mesa analisa
         public static byte[] SetRtaSourcePacket(int index)
         {
@@ -696,6 +753,7 @@ namespace TempOverlay
         Bitmap logo;
         public int WeatherCode = -1;
         public bool ReserveIcon;
+        public float[] Hist;         // historico do nivel do canal (waveform)
         public float[] RtaCap;       // picos (hold) do RTA, para as tampinhas flutuantes do grafico
         public string GraphName = "";
         public float[] Rta;          // espectro da X32 (dB por faixa) para o estilo com RTA
@@ -1203,11 +1261,39 @@ namespace TempOverlay
                 g.DrawString(GraphName, fLabel, bt, gx + 10 * k, gy + 6 * k, sf);
         }
 
+        // waveform: barras espelhadas arredondadas que rolam (o mais novo na direita), nivel do canal escolhido, sem fundo
+        void DrawWaveform(Graphics g, Config c, float gx, float gy, float gw, float gh, Font fLabel, StringFormat sf, float k, int alpha)
+        {
+            float top = gy + 26 * k, bottom = gy + gh - 8 * k;   // o topo fica reservado para o rotulo: as barras nunca passam dele
+            float mid = (top + bottom) / 2, maxH = (bottom - top) / 2;
+            float barW = Math.Max(2f, 4 * k), gapB = Math.Max(2f, 3 * k);
+            int N = Math.Max(8, (int)((gw - 16 * k) / (barW + gapB)));
+            float usedW = N * (barW + gapB) - gapB, x0 = gx + (gw - usedW) / 2;
+            float[] hs = Hist; float gain = Math.Max(0.1f, c.GraphGain / 100f);
+            Color ca = Parse(c.GraphColorA, Color.FromArgb(34, 211, 238)), cz = Parse(c.GraphColorB, Color.FromArgb(167, 139, 250));
+            using (LinearGradientBrush lg = new LinearGradientBrush(new PointF(x0, 0), new PointF(x0 + usedW, 0), Color.FromArgb(alpha, ca), Color.FromArgb(alpha, cz)))
+            using (Pen bar = new Pen(lg, barW))
+            {
+                bar.StartCap = LineCap.Round; bar.EndCap = LineCap.Round;
+                for (int i = 0; i < N; i++)
+                {
+                    int idx = hs == null ? -1 : hs.Length - N + i;
+                    float v = (hs != null && idx >= 0 && idx < hs.Length) ? hs[idx] : 0f;
+                    float amp = (float)Math.Pow(Math.Max(0f, Math.Min(1f, v * gain)), 0.6);
+                    float hh = Math.Max(barW / 2f, amp * maxH), bx = x0 + i * (barW + gapB) + barW / 2;
+                    g.DrawLine(bar, bx, mid - hh, bx, mid + hh);
+                }
+            }
+            using (Brush bt = new SolidBrush(Color.FromArgb(alpha, 138, 138, 138)))
+                g.DrawString(GraphName, fLabel, bt, gx + 8 * k, gy + 4 * k, sf);
+        }
+
         // grafico de barras estilo RTA (so para cima): barras fixas que sobem e descem, gradiente indigo -> roxo -> magenta -> laranja,
         // com "picos" flutuando acima de cada barra. Dados: RTA da mesa apontado para o canal escolhido.
         void DrawWave(Graphics g, Config c, float gx, float gy, float gw, float gh, Font fLabel, StringFormat sf, float k, int alpha)
         {
             if (c.GraphStyle == "pill") { DrawPill(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
+            if (c.GraphStyle == "wave") { DrawWaveform(g, c, gx, gy, gw, gh, fLabel, sf, k, alpha); return; }
             float padH = 6 * k, baseY = gy + gh - 18 * k, topY = gy + 26 * k, maxH = baseY - topY;
             float barW = Math.Max(4f, 11 * k), gapB = Math.Max(2f, 5 * k);
             int N = Math.Max(6, (int)((gw - 2 * padH + gapB) / (barW + gapB)));
@@ -1244,7 +1330,7 @@ namespace TempOverlay
                     float bh = Math.Max(3 * k, amp * maxH), bx = x0 + i * (barW + gapB);
                     g.FillRectangle(lg, bx, baseY - bh, barW, bh);
                     float capTop = baseY - Math.Max(bh, camp * maxH) - 7 * k - capH;
-                    g.FillRectangle(lg, bx, Math.Max(topY - 10 * k, capTop), barW, capH);
+                    g.FillRectangle(lg, bx, Math.Max(topY - 2 * k, capTop), barW, capH);   // picos tambem ficam abaixo do rotulo
                 }
                 using (Pen bl = new Pen(lg, Math.Max(2f, 3 * k)))
                 {
@@ -1492,7 +1578,8 @@ namespace TempOverlay
         }
         public static Color Parse(string s, Color def)
         {
-            try { return ColorTranslator.FromHtml(s); } catch { return def; }
+            if (string.IsNullOrWhiteSpace(s)) return def;   // cor vazia = padrao (ColorTranslator devolve preto transparente para "")
+            try { Color r = ColorTranslator.FromHtml(s); return r.IsEmpty ? def : r; } catch { return def; }
         }
         void Push(Bitmap bmp)
         {
@@ -1523,6 +1610,7 @@ namespace TempOverlay
         long airSinceTicks;
         float[] rta; DateTime rtaSeen = DateTime.MinValue;
         float[] rtaCap;
+        float[] hist = new float[160];
         string lastTip = "";
         readonly AutoResetEvent airWake = new AutoResetEvent(false);
         DateTime t0 = DateTime.Now, nextRetry = DateTime.MinValue, lastFetch = DateTime.MinValue;
@@ -1552,6 +1640,7 @@ namespace TempOverlay
             tmr.Interval = 3000; tmr.Tick += delegate { Tick(); }; tmr.Start();
             Thread airThread = new Thread(AirLoop); airThread.IsBackground = true; airThread.Name = "x32"; airThread.Start();
             Thread rtaThread = new Thread(RtaLoop); rtaThread.IsBackground = true; rtaThread.Name = "x32-rta"; rtaThread.Start();
+            Thread graphThread = new Thread(GraphLoop); graphThread.IsBackground = true; graphThread.Name = "x32-nivel"; graphThread.Start();
             Render(); Refresh(true);
             if (firstRun || (Cfg.Source == "city" && !Cfg.Lat.HasValue)) OpenSettings();
             Win.Trim();
@@ -1590,7 +1679,7 @@ namespace TempOverlay
             while (!exiting)
             {
                 string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
-                if (!((Cfg.HasRta || Cfg.HasGraph) && IPAddress.TryParse(ip, out a)))
+                if (!((Cfg.HasRta || (Cfg.HasGraph && Cfg.GraphStyle != "wave")) && IPAddress.TryParse(ip, out a)))
                 {
                     if (u != null) { u.Close(); u = null; }
                     if (rta != null) { rta = null; Post(delegate { Render(); }); }
@@ -1603,11 +1692,11 @@ namespace TempOverlay
                         if (u != null) u.Close();
                         u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue; curSrc = null;
                     }
-                    string wantSrc = Cfg.HasGraph ? (Cfg.GraphCh ?? "") : "";
+                    string wantSrc = (Cfg.HasGraph && Cfg.GraphStyle != "wave") ? (Cfg.GraphCh ?? "") : "";
                     if (wantSrc != curSrc)   // Painel 3: aponta o RTA da mesa para o canal escolhido nas configuracoes
                     {
                         curSrc = wantSrc; string nm; int si = X32.MeterIndex(wantSrc, out nm);
-                        if (Cfg.HasGraph && si >= 0) { byte[] sp = X32.SetRtaSourcePacket(si); u.Send(sp, sp.Length, ep); }
+                        if (wantSrc.Length > 0 && si >= 0) { byte[] sp = X32.SetRtaSourcePacket(si); u.Send(sp, sp.Length, ep); }
                     }
                     if ((DateTime.UtcNow - lastSub).TotalSeconds > 8) { byte[] sub = X32.RtaSubscribePacket(Cfg.HasGraph ? 1 : 2); u.Send(sub, sub.Length, ep); lastSub = DateTime.UtcNow; }   // 50 ms (graficos fluidos) / 100 ms
                     u.Client.ReceiveTimeout = 500;
@@ -1633,6 +1722,45 @@ namespace TempOverlay
                 {
                     if (rta != null && (DateTime.UtcNow - rtaSeen).TotalSeconds > 3) { rta = null; Post(delegate { Render(); }); }
                 }
+                catch (Exception) { Thread.Sleep(500); }
+            }
+            if (u != null) u.Close();
+        }
+        // waveform: nivel do canal escolhido (/meters/1), ~7 amostras por segundo, guardado num historico que o grafico desenha
+        void GraphLoop()
+        {
+            UdpClient u = null; IPEndPoint ep = null; string curIp = "";
+            DateTime lastSub = DateTime.MinValue;
+            while (!exiting)
+            {
+                string ip = Cfg.AirIp == null ? "" : Cfg.AirIp.Trim(); IPAddress a;
+                if (!(Cfg.HasGraph && Cfg.GraphStyle == "wave" && IPAddress.TryParse(ip, out a)))
+                {
+                    if (u != null) { u.Close(); u = null; }
+                    Thread.Sleep(1000); continue;
+                }
+                try
+                {
+                    if (u == null || ip != curIp)
+                    {
+                        if (u != null) u.Close();
+                        u = new UdpClient(AddressFamily.InterNetwork); ep = new IPEndPoint(IPAddress.Parse(ip), 10023); curIp = ip; lastSub = DateTime.MinValue;
+                    }
+                    if ((DateTime.UtcNow - lastSub).TotalSeconds > 8) { byte[] sub = X32.MeterSubscribePacket("/meters/1", 3); u.Send(sub, sub.Length, ep); lastSub = DateTime.UtcNow; }
+                    u.Client.ReceiveTimeout = 500;
+                    IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] d = u.Receive(ref from); float[] v;
+                    string nm; int idx = X32.MeterIndex(Cfg.GraphCh, out nm);
+                    if (idx >= 0 && X32.ParseMeterFloats(d, d.Length, "/meters/1", out v) && idx < v.Length)
+                    {
+                        float[] nh = new float[hist.Length];
+                        Array.Copy(hist, 1, nh, 0, hist.Length - 1);
+                        nh[nh.Length - 1] = Math.Max(0f, v[idx]);
+                        hist = nh;
+                        Post(delegate { Render(); });
+                    }
+                }
+                catch (SocketException) { }
                 catch (Exception) { Thread.Sleep(500); }
             }
             if (u != null) u.Close();
@@ -1679,6 +1807,7 @@ namespace TempOverlay
             Ov.AirState = airState;
             Ov.Rta = rta;
             Ov.RtaCap = rtaCap;
+            Ov.Hist = hist;
             { string gn; X32.MeterIndex(Cfg.GraphCh, out gn); Ov.GraphName = Cfg.GraphLabel.Trim().Length > 0 ? Cfg.GraphLabel.Trim() : gn; }
             Ov.AirSince = airSinceTicks > 0 ? new DateTime(airSinceTicks) : DateTime.MinValue;
             string tip = (Cfg.HasAir && Cfg.AirIp.Trim().Length > 0 && airState < 0) ? "TempOverlay - X32 sem resposta" : Const.App;
@@ -1928,8 +2057,8 @@ namespace TempOverlay
             tbGraphLabel = new TextBox { Left = 108, Top = 254, Width = 170, Text = c.GraphLabel };
             nudGain = new NumericUpDown { Left = 292, Top = 254, Width = 80, Minimum = 10, Maximum = 400, Value = Math.Max(10, Math.Min(400, c.GraphGain)) };
             cbGraphStyle = new ComboBox { Left = 14, Top = 312, Width = 210, DropDownStyle = ComboBoxStyle.DropDownList };
-            cbGraphStyle.Items.AddRange(new object[] { "Barras coloridas com picos", "Barras azuis arredondadas" });
-            cbGraphStyle.SelectedIndex = c.GraphStyle == "pill" ? 1 : 0;
+            cbGraphStyle.Items.AddRange(new object[] { "Barras coloridas com picos", "Barras azuis arredondadas", "Waveform (onda do nível do canal)" });
+            cbGraphStyle.SelectedIndex = c.GraphStyle == "wave" ? 2 : (c.GraphStyle == "pill" ? 1 : 0);
             chkReflect = new CheckBox { Text = "Reflexo", Left = 240, Top = 314, Width = 120, Checked = c.GraphReflect };
             graphColA = c.GraphColorA ?? ""; graphColB = c.GraphColorB ?? "";
             btnColA = Btn("", 14, 372, 64); btnColB = Btn("", 86, 372, 64);
@@ -1947,7 +2076,7 @@ namespace TempOverlay
             {
                 string ip = tbAirIp.Text.Trim(), ch = tbAirCh.Text, gch = tbGraphCh.Text;
                 string styleKey = StyleKeys[Math.Max(0, cbStyle.SelectedIndex)];
-                bool wantRta = styleKey == "panel2_air_rta", wantGraph = styleKey == "panel3_air_graph";
+                bool wantRta = styleKey == "panel2_air_rta", wantGraph = styleKey == "panel3_air_graph", wantWave = cbGraphStyle.SelectedIndex == 2;
                 lblAirTest.ForeColor = Ink2; lblAirTest.Text = "Consultando a mesa...";
                 ThreadPool.QueueUserWorkItem(delegate
                 {
@@ -1956,7 +2085,7 @@ namespace TempOverlay
                     {
                         r = X32.Describe(ip, ch);
                         if (wantRta) r += "\n" + X32.RtaProbe(ip);
-                        if (wantGraph) r += "\n" + X32.GraphProbe(ip, gch);
+                        if (wantGraph) r += "\n" + (wantWave ? X32.MeterProbe(ip, gch) : X32.GraphProbe(ip, gch));
                     }
                     catch (Exception ex) { r = "Erro: " + ex.Message; }
                     try { BeginInvoke((Action)delegate { lblAirTest.ForeColor = r.StartsWith("Conectado") ? Color.FromArgb(0x16, 0x65, 0x34) : Ink; lblAirTest.Text = r; }); } catch { }
@@ -2021,9 +2150,11 @@ namespace TempOverlay
         }
         void RefreshGraphSwatches()
         {
-            bool pill = cbGraphStyle.SelectedIndex == 1;
-            btnColA.BackColor = graphColA.Length > 0 ? Overlay.Parse(graphColA, Color.White) : (pill ? Color.FromArgb(70, 200, 250) : Color.FromArgb(99, 102, 241));
-            btnColB.BackColor = graphColB.Length > 0 ? Overlay.Parse(graphColB, Color.White) : (pill ? Color.FromArgb(12, 140, 210) : Color.FromArgb(251, 146, 60));
+            int gs = cbGraphStyle.SelectedIndex;   // 0 colorido, 1 azul arredondado, 2 waveform
+            Color da = gs == 1 ? Color.FromArgb(70, 200, 250) : (gs == 2 ? Color.FromArgb(34, 211, 238) : Color.FromArgb(99, 102, 241));
+            Color db = gs == 1 ? Color.FromArgb(12, 140, 210) : (gs == 2 ? Color.FromArgb(167, 139, 250) : Color.FromArgb(251, 146, 60));
+            btnColA.BackColor = graphColA.Length > 0 ? Overlay.Parse(graphColA, da) : da;
+            btnColB.BackColor = graphColB.Length > 0 ? Overlay.Parse(graphColB, db) : db;
         }
         void PickGraphColor(bool first)
         {
@@ -2115,7 +2246,7 @@ namespace TempOverlay
             if (sel != null) { c.CityName = sel.Name; c.CityDesc = sel.Desc; c.Lat = sel.Lat; c.Lon = sel.Lon; }
             c.Autostart = chkAuto.Checked; c.AutoUpdate = chkUpd.Checked;
             c.AirIp = tbAirIp.Text.Trim(); c.AirChannels = tbAirCh.Text.Trim().Length == 0 ? "1" : tbAirCh.Text.Trim();
-            c.GraphCh = tbGraphCh.Text.Trim().Length == 0 ? "1" : tbGraphCh.Text.Trim(); c.GraphLabel = tbGraphLabel.Text.Trim(); c.GraphStyle = cbGraphStyle.SelectedIndex == 1 ? "pill" : "gradient"; c.GraphReflect = chkReflect.Checked;
+            c.GraphCh = tbGraphCh.Text.Trim().Length == 0 ? "1" : tbGraphCh.Text.Trim(); c.GraphLabel = tbGraphLabel.Text.Trim(); c.GraphStyle = cbGraphStyle.SelectedIndex == 2 ? "wave" : (cbGraphStyle.SelectedIndex == 1 ? "pill" : "gradient"); c.GraphReflect = chkReflect.Checked;
             c.GraphColorA = graphColA; c.GraphColorB = graphColB; c.GraphGain = (int)nudGain.Value;
             c.AirFader = chkAirFader.Checked; c.AirText = tbAirText.Text.Trim().Length == 0 ? "NO AR" : tbAirText.Text.Trim();
             c.Save(); AppCtx.SetAutostart(c.Autostart);
